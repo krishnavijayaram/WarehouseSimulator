@@ -1,0 +1,51 @@
+name: warehouse_simulator
+description: >
+  WOIS — Warehouse Operations Intelligence System
+  Flutter client for WAAS v4 (MTech dissertation companion app).
+  Connects to the WIOS gateway (:8000) via REST + WebSocket.
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Networking ────────────────────────────────────────────────────────────
+  http: ^1.2.1                      # REST calls to gateway
+  web_socket_channel: ^2.4.5        # ws://host:8002/ws/sim  (20 Hz sim frames)
+
+  # ── State management ──────────────────────────────────────────────────────
+  flutter_riverpod: ^2.5.1          # providers for auth, sim state, chat
+
+  # ── Storage / Prefs ───────────────────────────────────────────────────────
+  shared_preferences: ^2.2.3        # persist WOIS session token
+
+  # ── Auth / OAuth ──────────────────────────────────────────────────────────
+  url_launcher: ^6.3.0              # open gateway OAuth URL in browser
+  app_links: ^6.3.3                 # deep-link callback: wois://auth-callback
+
+  # ── Navigation ────────────────────────────────────────────────────────────
+  go_router: ^13.2.0
+
+  # ── UI ────────────────────────────────────────────────────────────────────
+  google_fonts: ^6.2.1              # Share Tech Mono (matches web sim font)
+  fl_chart: ^0.68.0                 # KPI sparklines, battery bars
+  cupertino_icons: ^1.0.6
+
+  # ── Utils ─────────────────────────────────────────────────────────────────
+  intl: ^0.19.0                     # date formatting
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  build_runner: ^2.4.9
+  riverpod_generator: ^2.4.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
