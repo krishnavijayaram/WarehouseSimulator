@@ -3,26 +3,36 @@ library;
 
 import 'package:flutter/material.dart';
 import '../models/sim_frame.dart';
+import '../application/providers.dart' show PalletData;
 
 class RobotCard extends StatelessWidget {
-  const RobotCard({super.key, required this.robot});
+  const RobotCard({super.key, required this.robot, this.cargo});
   final Robot robot;
+  /// Pallet the robot is currently carrying (inbound robots only).
+  final PalletData? cargo;
 
-  Color get _stateColor => switch (robot.state) {
-    'PICKING'  => const Color(0xFF00FF88),
-    'MOVING'   => const Color(0xFF00D4FF),
-    'CHARGING' => const Color(0xFFFFCC00),
-    'ERROR'    => const Color(0xFFFF4444),
-    _          => const Color(0xFF8B949E),
-  };
+  /// Base color driven by state; overridden to orange when robot is loaded.
+  Color get _stateColor {
+    if (cargo != null) return const Color(0xFFFF8800); // orange = loaded
+    return switch (robot.state) {
+      'PICKING'  => const Color(0xFF00FF88),
+      'MOVING'   => const Color(0xFF00D4FF),
+      'CHARGING' => const Color(0xFFFFCC00),
+      'ERROR'    => const Color(0xFFFF4444),
+      _          => const Color(0xFF8B949E),
+    };
+  }
 
-  IconData get _stateIcon => switch (robot.state) {
-    'PICKING'  => Icons.shopping_basket,
-    'MOVING'   => Icons.directions_run,
-    'CHARGING' => Icons.battery_charging_full,
-    'ERROR'    => Icons.error_outline,
-    _          => Icons.pause_circle_outline,
-  };
+  IconData get _stateIcon {
+    if (cargo != null) return Icons.inventory_2; // box icon when loaded
+    return switch (robot.state) {
+      'PICKING'  => Icons.shopping_basket,
+      'MOVING'   => Icons.directions_run,
+      'CHARGING' => Icons.battery_charging_full,
+      'ERROR'    => Icons.error_outline,
+      _          => Icons.pause_circle_outline,
+    };
+  }
 
   @override
   Widget build(BuildContext context) => Card(
@@ -59,10 +69,39 @@ class RobotCard extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  'pos (${robot.x},${robot.y})',
+                  'pos (${robot.x.toStringAsFixed(0)},${robot.y.toStringAsFixed(0)})',
                   style: const TextStyle(fontSize: 9, color: Color(0xFF484F58), fontFamily: 'ShareTechMono'),
                 ),
               ]),
+              // ── On-hand cargo (inbound robots only) ───────────────────
+              if (cargo != null) ...[  
+                const SizedBox(height: 5),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF8800).withAlpha(20),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFFFF8800).withAlpha(80)),
+                  ),
+                  child: Row(children: [
+                    const Icon(Icons.inventory_2, size: 10, color: Color(0xFFFF8800)),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${cargo!.skuId}',
+                      style: const TextStyle(
+                          fontSize: 9,
+                          color: Color(0xFFFF8800),
+                          fontFamily: 'ShareTechMono',
+                          fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'via ${cargo!.truckId}',
+                      style: const TextStyle(fontSize: 9, color: Color(0xFF8B949E)),
+                    ),
+                  ]),
+                ),
+              ],
             ],
           ),
         ),
@@ -73,7 +112,10 @@ class RobotCard extends StatelessWidget {
         Column(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            _StateChip(robot.state, _stateColor),
+            _StateChip(
+              cargo != null ? 'LOADED' : robot.state,
+              _stateColor,
+            ),
             const SizedBox(height: 4),
             Text(
               '${robot.picks} picks',

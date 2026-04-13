@@ -105,6 +105,11 @@ final activeEventsProvider =
 /// 'manual'    = each step is triggered by the user pressing "Step".
 final simulationModeProvider = StateProvider<String>((ref) => 'automated');
 
+// ── Selected chatbot persona ──────────────────────────────────────────────────
+/// Tracks the active chatbot persona globally so the floor canvas can gate
+/// sabotage context-menu items on 'Sabotager'.
+final selectedPersonaProvider = StateProvider<String>((ref) => 'Manager');
+
 // ── Navigate-to-tab signal ────────────────────────────────────────────────────
 /// Set to a tab index to signal the shell to switch to that tab.
 /// Shell watches this and resets it to null after switching.
@@ -131,6 +136,12 @@ class ManualRobotPositionsNotifier
 
   void update(String robotId, int row, int col) {
     state = {...state, robotId: (row: row, col: col)};
+  }
+
+  void remove(String robotId) {
+    final next = Map<String, ({int row, int col})>.from(state)
+      ..remove(robotId);
+    state = next;
   }
 
   void clear() => state = const {};
@@ -169,6 +180,7 @@ class ManualRobotNotifier extends StateNotifier<ManualRobotController?> {
       config: config,
       token: token,
       onPositionUpdate: _ref.read(manualRobotPositionsProvider.notifier).update,
+      onRemovePosition: _ref.read(manualRobotPositionsProvider.notifier).remove,
       onMarkExplored: _ref.read(exploredCellsProvider.notifier).markExplored,
       onEventRaise: (r, c, type, color, speed) => _ref
           .read(activeEventsProvider.notifier)
@@ -193,19 +205,24 @@ final manualRobotControllerProvider =
 // ── Live robot positions (polls /api/v1/robot/positions every 3 s) ────────────
 
 /// Maps a REST robot payload + warehouse config → Flutter [Robot].
+/// The payload is now enriched by the backend with [name] and [functional_type]
+/// so downstream identity checks (e.g. inbound-only menus) work reliably.
 Robot _mapApiRobot(Map<String, dynamic> r, WarehouseConfig config) {
-  final id = r['robot_id'] as String? ?? '';
-  // Try matching spawn by name first, then by positional index.
-  final spawn =
-      config.robotSpawns.where((s) => (s.name ?? '') == id).firstOrNull;
+  final id   = r['robot_id']       as String? ?? '';
+  final name = r['name']           as String? ?? id;
+  final type = r['robot_type']     as String? ?? 'AMR';
+  final ft   = r['functional_type'] as String? ?? '';
+  // Derive WS-compatible domain so robot.isInbound works correctly.
+  final domain = ft == 'inbound_pick' ? 'INBOUND' : 'ANY';
   return Robot(
-    id: id,
-    name: spawn?.name ?? id,
-    type: spawn?.robotType ?? 'AMR',
-    x: (r['col'] as num? ?? 0).toDouble(),
-    y: (r['row'] as num? ?? 0).toDouble(),
-    state: (r['status'] as String? ?? 'IDLE').toUpperCase(),
+    id:      id,
+    name:    name,
+    type:    type,
+    x:       (r['col'] as num? ?? 0).toDouble(),
+    y:       (r['row'] as num? ?? 0).toDouble(),
+    state:   (r['status'] as String? ?? 'IDLE').toUpperCase(),
     battery: ((r['battery_level'] as num? ?? 100.0) / 100.0).clamp(0.0, 1.0),
+    domain:  domain,
   );
 }
 
@@ -281,3 +298,143 @@ final blockedCellsProvider =
     StateNotifierProvider<BlockedCellsNotifier, Set<String>>(
   (_) => BlockedCellsNotifier(),
 );
+
+// ── Inbound robot pallet cargo ────────────────────────────────────────────────
+
+/// One pallet that an inbound robot is currently carrying.
+class PalletData {
+  const PalletData({required this.skuId, required this.truckId});
+  final String skuId;
+  final String truckId;
+}
+
+class RobotCargoNotifier extends StateNotifier<Map<String, PalletData>> {
+  RobotCargoNotifier() : super(const {});
+
+  /// Re-hydrate from backend RobotHolding table. Called on startup and after
+  /// any operation that might lose in-memory state (e.g. page refresh).
+  /// This makes cargo tracking transactional — the backend is the source of
+  /// truth; the in-memory map is just a view over it.
+  Future<void> hydrateFromBackend() async {
+    try {
+      final holdings = await ApiClient.instance.getActiveHoldings();
+      final next = <String, PalletData>{};
+      for (final h in holdings) {
+        final robotId = h['robot_id'] as String?;
+        final skuId   = h['sku_id']   as String?;
+        final truckId = h['picked_from_id'] as String?;
+        if (robotId != null && skuId != null && skuId.isNotEmpty) {
+          next[robotId] = PalletData(
+            skuId:   skuId,
+            truckId: truckId ?? 'UNKNOWN',
+          );
+        }
+      }
+      state = next;
+    } catch (_) {
+      // Network unavailable — keep whatever is in memory; don't clear valid state.
+    }
+  }
+
+  void loadPallet(String robotId, PalletData pallet) {
+    state = {...state, robotId: pallet};
+  }
+
+  void clearCargo(String robotId) {
+    final m = Map<String, PalletData>.from(state);
+    m.remove(robotId);
+    state = m;
+  }
+}
+
+final robotCargoProvider =
+    StateNotifierProvider<RobotCargoNotifier, Map<String, PalletData>>(
+  (_) => RobotCargoNotifier(),
+);
+
+// ── Pallet staging SKU slots ──────────────────────────────────────────────────
+
+const int kMaxStagingPallets = 5;
+
+/// Pallets stored in one staging cell (enforces single-SKU, max-5 rule).
+class StagingSlot {
+  const StagingSlot({required this.skuId, required this.count});
+  final String skuId;
+  final int count;
+}
+
+class StagingNotifier extends StateNotifier<Map<String, StagingSlot>> {
+  StagingNotifier() : super(const {});
+
+  String _key(int row, int col) => '${row}_$col';
+
+  /// Returns null if the drop is permitted, or an error message if not.
+  String? canDrop(int row, int col, String skuId) {
+    final slot = state[_key(row, col)];
+    if (slot == null || slot.count == 0) return null; // empty — any SKU ok
+    if (slot.skuId != skuId) {
+      return 'SKU cannot be mixed — slot holds ${slot.skuId}';
+    }
+    if (slot.count >= kMaxStagingPallets) {
+      return 'Staging slot is full (max $kMaxStagingPallets pallets)';
+    }
+    return null;
+  }
+
+  void drop(int row, int col, String skuId) {
+    final k = _key(row, col);
+    final existing = state[k];
+    state = {
+      ...state,
+      k: StagingSlot(skuId: skuId, count: (existing?.count ?? 0) + 1),
+    };
+  }
+
+  StagingSlot? slotAt(int row, int col) => state[_key(row, col)];
+}
+
+final stagingPalletsProvider =
+    StateNotifierProvider<StagingNotifier, Map<String, StagingSlot>>(
+  (_) => StagingNotifier(),
+);
+
+// ── Pending truck selection (set by Orders screen → consumed by Floor screen) ─
+/// When the user taps "TRUCK ON ROAD" in the Orders screen we store the truck ID
+/// here.  The Floor screen listens, selects that truck, and clears this to null.
+final pendingTruckSelectionProvider = StateProvider<String?>((ref) => null);
+
+// ── Live inbound trucks (polls every 5 s) ─────────────────────────────────────
+/// Returns the latest inbound trucks + a shipments-by-truck map.
+/// Consumed by both the Dashboard Fleet section and the Floor screen.
+typedef InboundTruckData = ({
+  List<Map<String, dynamic>> trucks,
+  Map<String, List<Map<String, dynamic>>> shipmentsByTruck,
+});
+
+final inboundTrucksProvider =
+    StreamProvider.autoDispose<InboundTruckData>((ref) async* {
+  final config = ref.watch(warehouseConfigProvider);
+  if (config == null) {
+    yield (trucks: const [], shipmentsByTruck: const {});
+    return;
+  }
+  while (true) {
+    try {
+      final trucks = await ApiClient.instance.getInboundTrucks(config.id);
+      final shipments =
+          await ApiClient.instance.getInboundShipments(config.id);
+      final byTruck = <String, List<Map<String, dynamic>>>{};
+      for (final s in shipments) {
+        final tid = s['truck_id'] as String? ?? '';
+        byTruck.putIfAbsent(tid, () => []).add(s);
+      }
+      yield (
+        trucks: trucks,
+        shipmentsByTruck: Map.unmodifiable(byTruck),
+      );
+    } catch (_) {
+      yield (trucks: const [], shipmentsByTruck: const {});
+    }
+    await Future.delayed(const Duration(seconds: 5));
+  }
+});

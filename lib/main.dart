@@ -258,6 +258,7 @@ class _WoisAppState extends ConsumerState<WoisApp> {
         ref.read(operationsStartedProvider.notifier).state = true;
         ref.read(manualRobotControllerProvider.notifier).initialize(cfg);
         _restartScoutSim(cfg);
+        unawaited(_restoreRobotCargo());
       } else {
         // Backend online but no cells recorded yet — check local ops flag.
         await _restoreFromLocalPrefs(cfg);
@@ -300,6 +301,28 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     ref.read(operationsStartedProvider.notifier).state = true;
     ref.read(manualRobotControllerProvider.notifier).initialize(cfg);
     _restartScoutSim(cfg);
+    unawaited(_restoreRobotCargo());
+  }
+
+  /// Fetches all active robot holdings from the backend and seeds
+  /// [robotCargoProvider] so cargo is not lost after a page refresh.
+  Future<void> _restoreRobotCargo() async {
+    try {
+      final holdings = await ApiClient.instance.getActiveHoldings();
+      if (!mounted) return;
+      final cargoNotifier = ref.read(robotCargoProvider.notifier);
+      for (final h in holdings) {
+        final robotId = h['robot_id'] as String?;
+        final skuId = h['sku_id'] as String?;
+        final truckId = h['picked_from_id'] as String? ?? '';
+        if (robotId != null && skuId != null) {
+          cargoNotifier.loadPallet(
+              robotId, PalletData(skuId: skuId, truckId: truckId));
+        }
+      }
+    } catch (_) {
+      // Non-fatal — cargo starts empty; robot re-pick will reload it.
+    }
   }
 
   /// Creates a fresh RobotScoutSimulation for [cfg] in manual mode (paused).
@@ -310,7 +333,7 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     prev?.dispose();
     final scout = RobotScoutSimulation(
       config: cfg,
-      ref: ref as WidgetRef,
+      ref: ref,
       isSaboteur: false,
     );
     ref.read(scoutSimulationProvider.notifier).state = scout;

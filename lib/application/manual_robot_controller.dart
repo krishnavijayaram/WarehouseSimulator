@@ -96,6 +96,8 @@ class ManualRobotController {
     /// Called whenever a robot's position changes. Provider should update its
     /// map state so the floor CustomPainter repaints.
     required void Function(String robotId, int row, int col) onPositionUpdate,
+    /// Called to remove a robot from the positions map (e.g. replace placeholder).
+    void Function(String robotId)? onRemovePosition,
     /// Called for each cell to be revealed (fog-of-war). (row, col)
     required void Function(int row, int col) onMarkExplored,
     /// Raise an alert event on a cell. (row, col, type, color, speed)
@@ -108,6 +110,7 @@ class ManualRobotController {
     String? backendBase,
     String? token,
   })  : _onPositionUpdate = onPositionUpdate,
+        _onRemovePosition = onRemovePosition,
         _onMarkExplored   = onMarkExplored,
         _onEventRaise     = onEventRaise,
         _readSelectedId   = readSelectedId,
@@ -124,6 +127,7 @@ class ManualRobotController {
 
   // Callbacks (no Riverpod dependency here)
   final void Function(String, int, int) _onPositionUpdate;
+  final void Function(String)? _onRemovePosition;
   final void Function(int, int) _onMarkExplored;
   final void Function(int, int, String, String, String) _onEventRaise;
   final String? Function() _readSelectedId;
@@ -149,6 +153,9 @@ class ManualRobotController {
       const id = 'default-bot';
       _robots[id] = RobotState(
           robotId: id, row: first.row, col: first.col, robotType: 'AMR');
+      // Asynchronously replace 'default-bot' with real robots from the backend.
+      // This fires-and-forgets; the floor repaints when positions arrive.
+      _initRobotsFromApi();
     }
 
     // Push initial positions into provider (triggers floor repaint).
@@ -175,6 +182,61 @@ class ManualRobotController {
         battery: r.battery,
         cells:   _scanSurroundings(r.row, r.col),
       );
+    }
+  }
+
+  /// Async: replace the 'default-bot' placeholder with real robots fetched from
+  /// the backend. Uses the enriched /robot/positions endpoint which now returns
+  /// robot [name] (e.g. 'IR-01') and [functional_type] (e.g. 'inbound_pick').
+  Future<void> _initRobotsFromApi() async {
+    try {
+      final uri = Uri.parse('$_backendBase/api/v1/robot/positions')
+          .replace(queryParameters: {'warehouse_id': config.id});
+      final resp = await http.get(uri, headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': 'wois-gateway-internal-key-2026',
+        if (_token != null) 'Authorization': 'Bearer $_token',
+      });
+      if (resp.statusCode != 200) return;
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final robots =
+          (data['robots'] as List? ?? []).cast<Map<String, dynamic>>();
+      if (robots.isEmpty) return;
+
+      // Remove the placeholder and replace with real robots (keyed by name).
+      final prevSelected = _readSelectedId();
+      _robots.remove('default-bot');
+      _onRemovePosition?.call('default-bot');
+
+      for (final r in robots) {
+        // Use display name (e.g. 'IR-01') as the position key so that
+        // context-menu identity checks (isInboundRobot) work correctly.
+        final displayName =
+            (r['name'] as String?)?.isNotEmpty == true
+                ? r['name'] as String
+                : r['robot_id'] as String? ?? '';
+        if (displayName.isEmpty) continue;
+        final row      = r['row']        as int?    ?? 0;
+        final col      = r['col']        as int?    ?? 0;
+        final robotType = r['robot_type'] as String? ?? 'AMR';
+        _robots[displayName] = RobotState(
+            robotId: displayName, row: row, col: col, robotType: robotType);
+        _onPositionUpdate(displayName, row, col);
+      }
+
+      // Re-select: if the old selection was 'default-bot', pick the first
+      // real robot; otherwise keep whatever the user had selected.
+      if ((prevSelected == 'default-bot' || prevSelected == null) &&
+          _robots.isNotEmpty) {
+        _writeSelectedId(_robots.keys.first);
+      }
+
+      debugPrint(
+          'ManualRobotController: seeded ${_robots.length} real robot(s): '
+          '${_robots.keys.join(', ')}');
+    } catch (e) {
+      // Backend unavailable — keep the 'default-bot' fallback.
+      debugPrint('ManualRobotController: could not seed real robots: $e');
     }
   }
 

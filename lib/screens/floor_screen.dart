@@ -60,6 +60,15 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   Timer? _heartbeatTimer;
   String? _heartbeatWarehouseId; // tracks which warehouse the timer is for
 
+  // ── Inbound trucks overlay ──────────────────────────────────────────────
+  List<Map<String, dynamic>> _inboundTrucks = [];
+  Map<String, List<Map<String, dynamic>>> _shipmentsByTruck = {};
+  // truckId → 0.0 (outside) … 1.0 (at dock)
+  Map<String, double> _truckApproach = {};
+  Timer? _truckPollTimer;
+  String? _selectedTruckId;
+  String? _lastPolledWarehouseId;
+
   @override
   void initState() {
     super.initState();
@@ -68,14 +77,64 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
       duration: const Duration(milliseconds: 700),
     )..repeat(reverse: true);
     _blinkAnim = CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut);
+    _truckPollTimer =
+        Timer.periodic(const Duration(seconds: 5), (_) => _pollInboundTrucks());
   }
 
   @override
   void dispose() {
     _stopHeartbeat();
+    _truckPollTimer?.cancel();
     _blinkCtrl.dispose();
     _focusNode.dispose();
     super.dispose();
+  }
+
+  // ── Inbound truck polling ────────────────────────────────────────────────
+
+  Future<void> _pollInboundTrucks() async {
+    final cfg = ref.read(warehouseConfigProvider);
+    if (cfg == null) {
+      // Retry once more in case the config just loaded
+      Future.delayed(const Duration(seconds: 2), _pollInboundTrucks);
+      return;
+    }
+    try {
+      final results = await Future.wait([
+        ApiClient.instance.getInboundTrucks(cfg.id),
+        ApiClient.instance.getInboundShipments(cfg.id),
+      ]);
+      final trucks = results[0];
+      final shipments = results[1];
+
+      debugPrint(
+          '[FloorScreen] _pollInboundTrucks: got ${trucks.length} trucks for ${cfg.id}');
+
+      final byTruck = <String, List<Map<String, dynamic>>>{};
+      for (final s in shipments) {
+        final tid = s['truck_id'] as String? ?? '';
+        byTruck.putIfAbsent(tid, () => []).add(s);
+      }
+
+      // ENROUTE trucks park on the left road (progress=0.0 = stationary outside).
+      // All other statuses are at the dock (progress=1.0).
+      final approach = <String, double>{};
+      for (final t in trucks) {
+        final tid = t['truck_id'] as String? ?? '';
+        final status = t['status_actual'] as String? ?? '';
+        approach[tid] = (status == 'ENROUTE') ? 0.0 : 1.0;
+      }
+
+      if (mounted) {
+        setState(() {
+          _inboundTrucks = trucks;
+          _shipmentsByTruck = byTruck;
+          _truckApproach = approach;
+        });
+      }
+    } catch (e, st) {
+      debugPrint('[FloorScreen] _pollInboundTrucks ERROR: $e\n$st');
+    }
   }
 
   // ── Heartbeat helpers ─────────────────────────────────────────────────────
@@ -188,6 +247,34 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     final exploredCells = ref.watch(exploredCellsProvider);
     final activeEvents = ref.watch(activeEventsProvider);
     final blockedCells = ref.watch(blockedCellsProvider);
+
+    // Poll trucks immediately whenever the active warehouse changes.
+    ref.listen<WarehouseConfig?>(warehouseConfigProvider, (prev, next) {
+      if (next != null && next.id != _lastPolledWarehouseId) {
+        _lastPolledWarehouseId = next.id;
+        _pollInboundTrucks();
+      }
+    });
+    // Also poll on very first build if config is already set.
+    if (config != null && _lastPolledWarehouseId == null) {
+      _lastPolledWarehouseId = config.id;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _pollInboundTrucks());
+    }
+    // Auto-select a truck when navigated here from the Orders screen.
+    ref.listen<String?>(pendingTruckSelectionProvider, (_, truckId) {
+      if (truckId == null) return;
+      // Clear the signal immediately so it doesn't fire twice.
+      ref.read(pendingTruckSelectionProvider.notifier).state = null;
+      // Refresh truck list first, then select.
+      _pollInboundTrucks().then((_) {
+        if (mounted) {
+          setState(() {
+            _selectedTruckId = truckId;
+            _selectedRobot = null;
+          });
+        }
+      });
+    });
     final simMode = ref.watch(simulationModeProvider);
     final sim = ref.watch(scoutSimulationProvider);
     final manualPositions = ref.watch(manualRobotPositionsProvider);
@@ -197,9 +284,12 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     final lockHolderName = ref.watch(lockHolderNameProvider);
     final isViewer = opsStarted && editAccess == 'VIEWER';
 
-    // In manual mode use locally-tracked positions; otherwise WS frame / spawns.
+    // D-pad-moved robots take precedence in both simulation modes so that manual
+    // inbound operations (unload truck, drop at staging) remain accessible even
+    // while the auto-sim is running.
     final List<Robot> displayRobots;
     if (opsStarted && simMode == 'manual' && manualPositions.isNotEmpty) {
+      // Manual step mode: all robots driven exclusively by D-pad positions.
       displayRobots = manualPositions.entries
           .map((e) => Robot(
                 id: e.key,
@@ -212,7 +302,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
               ))
           .toList();
     } else {
-      displayRobots = frame.robots.isNotEmpty
+      // Automated mode: start from WS frame / spawns, then overlay any robots
+      // the user has manually moved via D-pad (for inbound ops in auto mode).
+      final base = frame.robots.isNotEmpty
           ? frame.robots
           : (config?.robotSpawns
                   .map((s) => Robot(
@@ -226,6 +318,26 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                       ))
                   .toList() ??
               []);
+      if (manualPositions.isNotEmpty) {
+        final manualIds = manualPositions.keys.toSet();
+        final overrides = manualPositions.entries
+            .map((e) => Robot(
+                  id: e.key,
+                  name: e.key,
+                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  x: e.value.col.toDouble(),
+                  y: e.value.row.toDouble(),
+                  state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',
+                  battery: 1.0,
+                ))
+            .toList();
+        displayRobots = [
+          ...base.where((r) => !manualIds.contains(r.id)),
+          ...overrides,
+        ];
+      } else {
+        displayRobots = base;
+      }
     }
 
     final floorRows = config?.rows ?? _kRows;
@@ -327,13 +439,30 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                       });
                     },
                     onTapUp: (d) {
+                      // Check truck hit first
+                      final truckHit = _truckAtLocal(d.localPosition, config,
+                          _inboundTrucks, _truckApproach);
+                      if (truckHit != null) {
+                        setState(() {
+                          _selectedTruckId =
+                              _selectedTruckId == truckHit ? null : truckHit;
+                          _selectedRobot = null;
+                        });
+                        return;
+                      }
                       final hit = _robotAtLocal(d.localPosition, displayRobots);
                       if (hit != null) {
-                        setState(() => _selectedRobot = hit);
+                        setState(() {
+                          _selectedRobot = hit;
+                          _selectedTruckId = null;
+                        });
                         ref.read(selectedRobotIdProvider.notifier).state =
                             hit.id;
                       } else if (!(opsStarted && simMode == 'manual')) {
-                        setState(() => _selectedRobot = null);
+                        setState(() {
+                          _selectedRobot = null;
+                          _selectedTruckId = null;
+                        });
                         ref.read(selectedRobotIdProvider.notifier).state = null;
                       }
                     },
@@ -350,13 +479,17 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                             cols: floorCols,
                             scale: _scale,
                             offset: _offset,
-                            warehouseConfig: opsStarted ? config : null,
+                            warehouseConfig: config,
                             exploredCells:
                                 opsStarted ? exploredCells : const {},
                             activeEvents: activeEvents,
                             blinkPhase: _blinkAnim.value,
                             selectedRobotId: selectedRobotId,
                             blockedCells: opsStarted ? blockedCells : const {},
+                            inboundTrucks: _inboundTrucks,
+                            shipmentsByTruck: _shipmentsByTruck,
+                            truckApproach: _truckApproach,
+                            selectedTruckId: _selectedTruckId,
                           ),
                           child: const SizedBox.expand(),
                         ),
@@ -367,8 +500,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
               );
             }),
 
-            // ── Pre-operations blank overlay + Start button ───────────────────
-            if (!opsStarted && config != null) _buildStartOpsOverlay(config),
+            // ── Start Operations button (floor is always visible; button
+            //    floats in bottom-right so trucks/floor show immediately) ──────
+            if (!opsStarted && config != null) _buildStartOpsButton(config),
 
             // ── View-mode banner (another session holds the edit lock) ─────
             if (isViewer)
@@ -408,7 +542,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
             // ── End of floor overlay stack ────────────────────────────────
 
             // ── D-pad: manual robot control ────────────────────────────────────
-            if (opsStarted && simMode == 'manual' && manualCtrl != null)
+            if (opsStarted && manualCtrl != null)
               Positioned(
                 bottom: 24,
                 left: 0,
@@ -440,6 +574,14 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
             // ── Robot info panel ─────────────────────────────────────────────
             if (opsStarted && _selectedRobot != null)
               _buildRobotPanel(_selectedRobot!, frame),
+
+            // ── Truck info panel — always visible (not gated by opsStarted) ──
+            if (_selectedTruckId != null)
+              _buildTruckPanel(
+                _selectedTruckId!,
+                _inboundTrucks,
+                _shipmentsByTruck,
+              ),
 
             // ── Speech bubbles ───────────────────────────────────────────────
             if (opsStarted)
@@ -554,6 +696,39 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Compact floating button shown before ops start so the floor/trucks remain
+  /// fully visible. The old full-screen overlay is replaced by this.
+  Widget _buildStartOpsButton(WarehouseConfig config) {
+    return Positioned(
+      right: 16,
+      bottom: 16,
+      child: ElevatedButton.icon(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF00D4FF),
+          foregroundColor: Colors.black,
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          textStyle: const TextStyle(
+              fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+        icon: const Icon(Icons.play_circle_outline, size: 20),
+        label: const Text('START OPERATIONS'),
+        onPressed: () async {
+          ref.read(simulationModeProvider.notifier).state = 'manual';
+          ref.read(exploredCellsProvider.notifier).reset();
+          ref.read(activeEventsProvider.notifier).resolveAll();
+          ref.read(operationsStartedProvider.notifier).state = true;
+          ref.read(manualRobotControllerProvider.notifier).initialize(config);
+          await _startHeartbeat(config);
+          final access = ref.read(editAccessProvider);
+          if (access != 'VIEWER') {
+            _launchSimulation(config);
+          }
+        },
       ),
     );
   }
@@ -973,6 +1148,205 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
         ]),
       );
 
+  // ── Truck info panel ──────────────────────────────────────────────────────
+
+  Widget _buildTruckPanel(
+    String truckId,
+    List<Map<String, dynamic>> trucks,
+    Map<String, List<Map<String, dynamic>>> shipmentsByTruck,
+  ) {
+    final truck = trucks.firstWhere(
+      (t) => t['truck_id'] == truckId,
+      orElse: () => const {},
+    );
+    final lines = shipmentsByTruck[truckId] ?? [];
+    final status = truck['status_actual'] as String? ?? '?';
+    final truckType = truck['truck_type'] as String? ?? '?';
+    final carrier = truck['carrier_name'] as String? ?? '';
+
+    final statusColor = switch (status) {
+      'ENROUTE' => const Color(0xFFFFCC00),
+      'ARRIVED' || 'YARD_ASSIGNED' => const Color(0xFF00D4FF),
+      'WAITING' || 'UNLOADING' => const Color(0xFF00FF88),
+      _ => const Color(0xFF8B949E),
+    };
+
+    const mono = TextStyle(
+        fontSize: 10, color: Color(0xFF8B949E), fontFamily: 'ShareTechMono');
+
+    return Positioned(
+      top: 60,
+      right: 16,
+      child: GestureDetector(
+        onTap: () => setState(() => _selectedTruckId = null),
+        child: Container(
+          width: 230,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1117).withAlpha(245),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF30363D)),
+          ),
+          child: DefaultTextStyle(
+            style: mono,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(children: [
+                  Expanded(
+                    child: Text(
+                      truckId,
+                      style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFFE6EDF3),
+                          fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const Text('✕', style: TextStyle(color: Color(0xFF8B949E))),
+                ]),
+                const SizedBox(height: 6),
+                _rpRow('Status', status),
+                _rpRow('Type', truckType),
+                if (carrier.isNotEmpty) _rpRow('Carrier', carrier),
+                // Status badge
+                const SizedBox(height: 4),
+                Row(children: [
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: statusColor.withAlpha(30),
+                      borderRadius: BorderRadius.circular(3),
+                      border: Border.all(color: statusColor.withAlpha(80)),
+                    ),
+                    child: Text(status,
+                        style: TextStyle(
+                            color: statusColor,
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ]),
+                // ── Move to inbound bay button (ENROUTE only) ──────────────
+                if (status == 'ENROUTE') ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TruckMoveButton(
+                      truckId: truckId,
+                      onMoved: () {
+                        setState(() => _selectedTruckId = null);
+                        _pollInboundTrucks();
+                      },
+                    ),
+                  ),
+                ],
+                if (lines.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  const Text('CARGO',
+                      style: TextStyle(
+                          color: Color(0xFFE6EDF3), letterSpacing: 1)),
+                  const SizedBox(height: 4),
+                  ...lines.map((l) {
+                    final sku = l['sku_id'] as String? ?? '?';
+                    final pallets =
+                        (l['qty_pallets_expected'] as num? ?? 0).toInt();
+                    final shipStatus = l['status'] as String? ?? '';
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Row(children: [
+                        const Text('📦 ', style: TextStyle(fontSize: 9)),
+                        Expanded(
+                            child: Text(sku, overflow: TextOverflow.ellipsis)),
+                        Text('$pallets plt',
+                            style: const TextStyle(
+                                color: Color(0xFF00D4FF),
+                                fontWeight: FontWeight.bold)),
+                        const SizedBox(width: 4),
+                        Text(shipStatus,
+                            style: TextStyle(color: statusColor, fontSize: 9)),
+                      ]),
+                    );
+                  }),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Truck hit-test ────────────────────────────────────────────────────────
+
+  /// Returns the truck_id if the tap position overlaps any drawn truck.
+  String? _truckAtLocal(
+    Offset local,
+    WarehouseConfig? config,
+    List<Map<String, dynamic>> trucks,
+    Map<String, double> approach,
+  ) {
+    if (config == null || trucks.isEmpty || _canvasSize == Size.zero)
+      return null;
+    final rows = config.rows;
+    final cols = config.cols;
+    final cw = (_canvasSize.width / cols) * _scale;
+    final ch = (_canvasSize.height / rows) * _scale;
+
+    final dockCells =
+        config.cells.where((c) => c.type == CellType.dock).toList();
+    if (dockCells.isEmpty) return null;
+
+    final avgDockCol =
+        dockCells.fold<double>(0.0, (s, d) => s + d.col) / dockCells.length;
+    final fromLeft = avgDockCol <= (cols / 2);
+
+    final roadCells2 = config.cells
+        .where((c) => c.type.isRoad)
+        .where((c) => fromLeft ? c.col <= 1 : c.row <= 1)
+        .toList()
+      ..sort(
+          (a, b) => fromLeft ? a.row.compareTo(b.row) : a.col.compareTo(b.col));
+
+    int slot = 0;
+    for (final truck in trucks) {
+      final tid = truck['truck_id'] as String? ?? '';
+      final progress = approach[tid] ?? 1.0;
+      final dock = dockCells[slot % dockCells.length];
+      slot++;
+
+      final dockCenter = Offset(
+        _offset.dx + (dock.col + 0.5) * cw,
+        _offset.dy + (dock.row + 0.5) * ch,
+      );
+      final Offset truckCenter;
+      if (progress < 1.0) {
+        // Mirror the draw logic: ENROUTE trucks at top-left corner, stacking by slot.
+        final enrouteRow = slot - 1;
+        if (fromLeft) {
+          truckCenter = Offset(
+            _offset.dx + 0.5 * cw,
+            _offset.dy + (enrouteRow + 0.5) * ch,
+          );
+        } else {
+          truckCenter = Offset(
+            _offset.dx + (enrouteRow + 0.5) * cw,
+            _offset.dy + 0.5 * ch,
+          );
+        }
+      } else {
+        truckCenter = dockCenter;
+      }
+
+      final tw = cw * 1.1;
+      final th = ch * 0.7;
+      final hitRect =
+          Rect.fromCenter(center: truckCenter, width: tw + 10, height: th + 10);
+      if (hitRect.contains(local)) return tid;
+    }
+    return null;
+  }
+
   // ── Speech bubble overlay ─────────────────────────────────────────────────
 
   List<Widget> _buildSpeechBubbles(
@@ -994,6 +1368,60 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
       );
     }).toList();
   }
+}
+
+// ── Truck move button ───────────────────────────────────────────────────────
+
+class TruckMoveButton extends StatefulWidget {
+  const TruckMoveButton(
+      {super.key, required this.truckId, required this.onMoved});
+  final String truckId;
+  final VoidCallback onMoved;
+
+  @override
+  State<TruckMoveButton> createState() => _TruckMoveButtonState();
+}
+
+class _TruckMoveButtonState extends State<TruckMoveButton> {
+  bool _loading = false;
+
+  Future<void> _move() async {
+    setState(() => _loading = true);
+    try {
+      await ApiClient.instance.dispatchTruck(widget.truckId);
+      if (!mounted) return;
+      widget.onMoved();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: const Color(0xFFFF4444).withAlpha(200),
+        content: Text(e.toString().replaceFirst('Exception: ', ''),
+            style: const TextStyle(color: Color(0xFFE6EDF3))),
+      ));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => FilledButton.icon(
+        style: FilledButton.styleFrom(
+          backgroundColor: const Color(0xFFFFCC00).withAlpha(30),
+          foregroundColor: const Color(0xFFFFCC00),
+          side: const BorderSide(color: Color(0xFFFFCC00)),
+          textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+        ),
+        onPressed: _loading ? null : _move,
+        icon: _loading
+            ? const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Color(0xFFFFCC00)))
+            : const Icon(Icons.local_shipping, size: 14),
+        label: Text(_loading ? 'MOVING…' : 'MOVE TO INBOUND BAY'),
+      );
 }
 
 // ── Legend ─────────────────────────────────────────────────────────────────
@@ -1070,7 +1498,7 @@ class _InfoBadge extends StatelessWidget {
 
 // ── Scout progress badge ─────────────────────────────────────────────────────
 
-class ScoutProgressBadge extends StatelessWidget {
+class ScoutProgressBadge extends StatefulWidget {
   const ScoutProgressBadge({
     super.key,
     required this.explored,
@@ -1081,8 +1509,44 @@ class ScoutProgressBadge extends StatelessWidget {
   final String simMode;
 
   @override
+  State<ScoutProgressBadge> createState() => _ScoutProgressBadgeState();
+}
+
+class _ScoutProgressBadgeState extends State<ScoutProgressBadge> {
+  bool _hidden = false;
+  DateTime? _completedAt;
+
+  @override
+  void didUpdateWidget(ScoutProgressBadge old) {
+    super.didUpdateWidget(old);
+    final nowComplete = widget.total > 0 && widget.explored >= widget.total;
+    final wasComplete = old.total > 0 && old.explored >= old.total;
+    if (nowComplete && !wasComplete) {
+      // Just hit 100% — start the 60-second hide timer
+      _completedAt = DateTime.now();
+      Future.delayed(const Duration(minutes: 1), () {
+        if (mounted &&
+            _completedAt != null &&
+            DateTime.now().difference(_completedAt!) >=
+                const Duration(minutes: 1)) {
+          setState(() => _hidden = true);
+        }
+      });
+    }
+    // If scouting resets (total changes / explored drops), show again
+    if (!nowComplete && _hidden) {
+      setState(() {
+        _hidden = false;
+        _completedAt = null;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final pct = total > 0 ? (explored / total * 100).round() : 0;
+    if (_hidden) return const SizedBox.shrink();
+    final pct =
+        widget.total > 0 ? (widget.explored / widget.total * 100).round() : 0;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
@@ -1100,7 +1564,7 @@ class ScoutProgressBadge extends StatelessWidget {
               const Icon(Icons.radar, color: Color(0xFF00D4FF), size: 13),
               const SizedBox(width: 5),
               Text(
-                'SCOUTING  $pct%  ($explored/$total cells)',
+                'SCOUTING  $pct%  (${widget.explored}/${widget.total} cells)',
                 style: const TextStyle(
                     color: Color(0xFF00D4FF),
                     fontSize: 10,
@@ -1110,15 +1574,15 @@ class ScoutProgressBadge extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                 decoration: BoxDecoration(
-                  color: simMode == 'automated'
+                  color: widget.simMode == 'automated'
                       ? const Color(0xFF00D4FF).withAlpha(30)
                       : const Color(0xFFF97316).withAlpha(30),
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
-                  simMode.toUpperCase(),
+                  widget.simMode.toUpperCase(),
                   style: TextStyle(
-                      color: simMode == 'automated'
+                      color: widget.simMode == 'automated'
                           ? const Color(0xFF00D4FF)
                           : const Color(0xFFF97316),
                       fontSize: 9,
@@ -1133,7 +1597,7 @@ class ScoutProgressBadge extends StatelessWidget {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(2),
               child: LinearProgressIndicator(
-                value: total > 0 ? explored / total : 0,
+                value: widget.total > 0 ? widget.explored / widget.total : 0,
                 minHeight: 3,
                 backgroundColor: const Color(0xFF1C2128),
                 valueColor: const AlwaysStoppedAnimation(Color(0xFF00D4FF)),
@@ -1224,6 +1688,12 @@ class FloorPainter extends CustomPainter {
     this.blinkPhase = 0.0,
     this.selectedRobotId,
     this.blockedCells = const {},
+    this.inboundTrucks = const [],
+    this.shipmentsByTruck = const {},
+    this.truckApproach = const {},
+    this.selectedTruckId,
+    this.robotCargo = const {},
+    this.stagingPallets = const {},
   });
 
   final List<Robot> robots;
@@ -1234,21 +1704,34 @@ class FloorPainter extends CustomPainter {
   final WarehouseConfig? warehouseConfig;
 
   /// Set of "row,col" keys for cells revealed by robot scouting.
-  /// Empty set = all cells are in fog (operations not started or no scouting yet).
   final Set<String> exploredCells;
 
   /// Map from "row,col" → event descriptor for cells that should blink.
   final Map<String, String> activeEvents;
 
-  /// 0.0–1.0 animation phase for blinking (driven by AnimationController outside).
+  /// 0.0–1.0 animation phase for blinking.
   final double blinkPhase;
 
-  /// The robot ID currently selected for D-pad control (highlighted on canvas).
+  /// The robot ID currently selected for D-pad control.
   final String? selectedRobotId;
 
-  /// Set of "row,col" strings for physically blocked cells (RealityCell.is_blocked).
-  /// Rendered as a red/orange X overlay so the operator sees actual obstructions.
+  /// Set of "row,col" strings for physically blocked cells.
   final Set<String> blockedCells;
+
+  // ── Inbound truck data ───────────────────────────────────────────────────
+  final List<Map<String, dynamic>> inboundTrucks;
+  final Map<String, List<Map<String, dynamic>>> shipmentsByTruck;
+
+  /// truckId → 0.0 (outside canvas) … 1.0 (parked at dock)
+  final Map<String, double> truckApproach;
+  final String? selectedTruckId;
+
+  // ── Inbound robot pallet cargo ────────────────────────────────────────────
+  /// robotId → PalletData for any inbound robot currently carrying a pallet.
+  final Map<String, PalletData> robotCargo;
+
+  /// "row_col" → StagingSlot for pallet staging cells with pallets on them.
+  final Map<String, StagingSlot> stagingPallets;
 
   bool _isExplored(int row, int col) =>
       exploredCells.isEmpty || exploredCells.contains('$row,$col');
@@ -1294,6 +1777,8 @@ class FloorPainter extends CustomPainter {
     _drawRobots(canvas, size);
     _drawBlockedCells(canvas, size);
     _drawFogOfWar(canvas, size);
+    _drawInboundTrucks(
+        canvas, size); // drawn AFTER fog so trucks are always visible
     _drawBlinkingEvents(canvas, size);
   }
 
@@ -1431,7 +1916,172 @@ class FloorPainter extends CustomPainter {
       old.scale != scale ||
       old.offset != offset ||
       old.selectedRobotId != selectedRobotId ||
-      old.blockedCells != blockedCells;
+      old.blockedCells != blockedCells ||
+      old.inboundTrucks != inboundTrucks ||
+      old.truckApproach != truckApproach ||
+      old.selectedTruckId != selectedTruckId ||
+      old.robotCargo != robotCargo ||
+      old.stagingPallets != stagingPallets;
+
+  // ── Inbound truck drawing ─────────────────────────────────────────────────
+  // Each active inbound truck is drawn as a top-down truck silhouette.
+  // ENROUTE: approaches from outside the canvas toward the nearest dock cell.
+  // ARRIVED/WAITING: parked at the dock cell.
+  void _drawInboundTrucks(Canvas canvas, Size size) {
+    if (inboundTrucks.isEmpty) return;
+    if (warehouseConfig == null) return;
+
+    final cw = _cw(size);
+    final ch = _ch(size);
+
+    // Use CellType.inbound marker cells to identify the receiving side.
+    // Then limit truck-bay targets to dock cells on that side only,
+    // so inbound trucks never target outbound (OUT-*) bays.
+    final inboundMarkers = warehouseConfig!.cells
+        .where((c) => c.type == CellType.inbound)
+        .toList();
+    final allDocks =
+        warehouseConfig!.cells.where((c) => c.type == CellType.dock).toList();
+
+    final double refCol = inboundMarkers.isNotEmpty
+        ? inboundMarkers.fold<double>(0.0, (s, d) => s + d.col) /
+            inboundMarkers.length
+        : (allDocks.isEmpty
+            ? 0.0
+            : allDocks.fold<double>(0.0, (s, d) => s + d.col) /
+                allDocks.length);
+    final fromLeft = (allDocks.isEmpty && inboundMarkers.isEmpty)
+        ? true
+        : refCol <= (warehouseConfig!.cols / 2);
+
+    // Target only dock bays on the inbound side.
+    final dockCells = (allDocks.isNotEmpty ? allDocks : inboundMarkers)
+        .where((c) => fromLeft
+            ? c.col <= (warehouseConfig!.cols / 2)
+            : c.col > (warehouseConfig!.cols / 2))
+        .toList()
+      ..sort(
+          (a, b) => fromLeft ? a.row.compareTo(b.row) : a.col.compareTo(b.col));
+
+    // Collect road cells on the same side as the inbound docks so ENROUTE
+    // trucks are parked visibly ON the warehouse road, ordered top-to-bottom
+    // (fromLeft) or left-to-right (fromTop).
+    final roadCells = warehouseConfig!.cells
+        .where((c) => c.type.isRoad)
+        .where((c) => fromLeft ? c.col <= 1 : c.row <= 1)
+        .toList()
+      ..sort(
+          (a, b) => fromLeft ? a.row.compareTo(b.row) : a.col.compareTo(b.col));
+
+    int slotIndex = 0;
+    for (final truck in inboundTrucks) {
+      final tid = truck['truck_id'] as String? ?? '';
+      final status = truck['status_actual'] as String? ?? '';
+      final progress = truckApproach[tid] ?? 1.0;
+
+      // Assign dock cell round-robin (falls back to grid origin when no docks).
+      final dock =
+          dockCells.isNotEmpty ? dockCells[slotIndex % dockCells.length] : null;
+      slotIndex++;
+
+      final dockCenter = dock != null
+          ? Offset(
+              offset.dx + (dock.col + 0.5) * cw,
+              offset.dy + (dock.row + 0.5) * ch,
+            )
+          : Offset(offset.dx + 0.5 * cw, offset.dy + 0.5 * ch);
+
+      // ENROUTE trucks park at the top-left corner of the warehouse road
+      // (col=0, starting at row=0), stacking downward for multiple trucks.
+      // WAITING/ARRIVED trucks park at their dock cell.
+      final Offset truckCenter;
+      if (progress < 1.0) {
+        // Each ENROUTE truck sits at row = (slotIndex - 1) so they don't overlap.
+        final enrouteRow = slotIndex - 1;
+        if (fromLeft) {
+          truckCenter = Offset(
+            offset.dx + 0.5 * cw,
+            offset.dy + (enrouteRow + 0.5) * ch,
+          );
+        } else {
+          truckCenter = Offset(
+            offset.dx + (enrouteRow + 0.5) * cw,
+            offset.dy + 0.5 * ch,
+          );
+        }
+      } else {
+        truckCenter = dockCenter;
+      }
+
+      // Choose color by status
+      final color = switch (status) {
+        'ENROUTE' => const Color(0xFFFFCC00),
+        'ARRIVED' || 'YARD_ASSIGNED' => const Color(0xFF00D4FF),
+        'WAITING' || 'UNLOADING' => const Color(0xFF00FF88),
+        _ => const Color(0xFF8B949E),
+      };
+
+      final isSelected = selectedTruckId == tid;
+      // Draw trucks sized to fit within one cell.
+      final tw = cw * 0.9;
+      final th = ch * 0.9;
+
+      // selection glow
+      if (isSelected) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(center: truckCenter, width: tw + 6, height: th + 6),
+            const Radius.circular(4),
+          ),
+          Paint()..color = color.withAlpha(80),
+        );
+      }
+
+      // Truck body (cab on left + trailer)
+      final cabW = tw * 0.28;
+      final trailerW = tw - cabW;
+      // Trailer
+      final trailerRect = fromLeft
+          ? Rect.fromLTWH(truckCenter.dx - tw / 2 + cabW,
+              truckCenter.dy - th / 2, trailerW, th)
+          : Rect.fromLTWH(truckCenter.dx - th / 2,
+              truckCenter.dy - tw / 2 + cabW, th, trailerW);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(trailerRect, const Radius.circular(2)),
+        Paint()..color = color.withAlpha(200),
+      );
+      // Cab
+      final cabRect = fromLeft
+          ? Rect.fromLTWH(
+              truckCenter.dx - tw / 2, truckCenter.dy - th / 2, cabW, th)
+          : Rect.fromLTWH(
+              truckCenter.dx - th / 2, truckCenter.dy - tw / 2, th, cabW);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(cabRect, const Radius.circular(2)),
+        Paint()..color = color,
+      );
+      // Cab window
+      final winShrink = fromLeft ? 0.55 : 0.55;
+      final winRect = cabRect.deflate(cabRect.shortestSide * winShrink);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(winRect, const Radius.circular(1)),
+        Paint()..color = const Color(0xFF0D1117).withAlpha(200),
+      );
+
+      // Short "TR" label centred on the trailer — always visible
+      final trailerCenter = fromLeft
+          ? Offset(truckCenter.dx + cabW / 2, truckCenter.dy)
+          : Offset(truckCenter.dx, truckCenter.dy + cabW / 2);
+      _drawTextCentered(
+          canvas, 'TR', trailerCenter, (th * 0.42).clamp(5.0, 12.0),
+          color: const Color(0xFF0D1117));
+
+      // Full ID below the truck body — visible when scale is large enough
+      _drawTextCentered(canvas, tid, truckCenter + Offset(0, th / 2 + 5),
+          (7.0).clamp(5.0, 10.0),
+          color: color.withAlpha(230));
+    }
+  }
 
   void _drawZones(Canvas canvas, Size size) {
     final cw = _cw(size);
@@ -1513,7 +2163,8 @@ class FloorPainter extends CustomPainter {
 
         // Dock — skeleton wireframe (bay outline only; truck is the occupant)
         if (cell.type == CellType.dock) {
-          _drawDockCell(canvas, rect);
+          final isInbound = cell.col <= (cols / 2);
+          _drawDockCell(canvas, rect, isInbound: isInbound);
           continue;
         }
 
@@ -1601,6 +2252,48 @@ class FloorPainter extends CustomPainter {
         if (cell.type == CellType.dump && scale > 0.8) {
           _drawTextCentered(
               canvas, '🗑', rect.center, 9 * scale.clamp(0.6, 2.0));
+        }
+
+        // Pallet staging: draw pallet count badge if any pallets are stored
+        if (cell.type == CellType.palletStaging) {
+          final slot = stagingPallets['${cell.row}_${cell.col}'];
+          if (slot != null && slot.count > 0) {
+            // Pallet stack icon + count
+            final badgeColor = slot.count >= kMaxStagingPallets
+                ? const Color(0xFFEF4444) // full — red
+                : const Color(0xFFD97706); // has pallets — amber
+            canvas.drawRRect(
+              RRect.fromRectAndRadius(
+                Rect.fromCenter(
+                    center: rect.center - Offset(0, rect.height * 0.05),
+                    width: rect.width * 0.80,
+                    height: rect.height * 0.44),
+                Radius.circular(rect.shortestSide * 0.08),
+              ),
+              Paint()..color = badgeColor.withAlpha(180),
+            );
+            if (scale > 0.6) {
+              _drawTextCentered(
+                canvas,
+                '🏗 ${slot.count}/$kMaxStagingPallets',
+                rect.center - Offset(0, rect.height * 0.05),
+                (rect.shortestSide * 0.28).clamp(6.0, 11.0),
+                color: Colors.white,
+              );
+              if (scale > 1.0) {
+                final sku = slot.skuId;
+                final skuShort =
+                    sku.length > 9 ? sku.substring(sku.length - 9) : sku;
+                _drawTextCentered(
+                  canvas,
+                  skuShort,
+                  rect.center + Offset(0, rect.height * 0.28),
+                  (rect.shortestSide * 0.18).clamp(5.0, 8.0),
+                  color: Colors.white70,
+                );
+              }
+            }
+          }
         }
       }
     } else {
@@ -1751,19 +2444,22 @@ class FloorPainter extends CustomPainter {
   }
 
   // ── Dock cell renderer (skeleton wireframe only) ────────────────────────────
-  void _drawDockCell(Canvas canvas, Rect rect) {
+  void _drawDockCell(Canvas canvas, Rect rect, {bool isInbound = true}) {
+    final color = isInbound
+        ? const Color(0xFF0F766E) // teal — inbound
+        : const Color(0xFFB91C1C); // red  — outbound
     canvas.drawRect(rect, Paint()..color = const Color(0xFF0D1117));
-    // Amber wireframe border
+    // Coloured wireframe border
     canvas.drawRect(
       rect.deflate(0.5),
       Paint()
-        ..color = const Color(0xFFD97706).withAlpha(200)
+        ..color = color.withAlpha(220)
         ..style = PaintingStyle.stroke
         ..strokeWidth = max(1.2, rect.shortestSide * 0.07),
     );
     // Corner bumpers
     final bump = rect.shortestSide * 0.14;
-    final bumpP = Paint()..color = const Color(0xFFD97706).withAlpha(160);
+    final bumpP = Paint()..color = color.withAlpha(180);
     for (final corner in [
       rect.topLeft,
       rect.topRight,
@@ -1773,9 +2469,10 @@ class FloorPainter extends CustomPainter {
       canvas.drawRect(
           Rect.fromCenter(center: corner, width: bump, height: bump), bumpP);
     }
-    if (scale > 0.7) {
-      _drawTextCentered(canvas, 'BAY', rect.center, rect.shortestSide * 0.22,
-          color: const Color(0xFFD97706).withAlpha(160));
+    if (scale > 0.5) {
+      final label = isInbound ? 'IN BAY' : 'OUT BAY';
+      _drawTextCentered(canvas, label, rect.center, rect.shortestSide * 0.20,
+          color: color.withAlpha(200));
     }
   }
 
@@ -1982,6 +2679,42 @@ class FloorPainter extends CustomPainter {
         final y = (c.dy - bodyH * 0.275) + i * bodyH * 0.18;
         canvas.drawLine(Offset(c.dx - bodyW * 0.375, y),
             Offset(c.dx + bodyW * 0.375, y), gp);
+      }
+    }
+
+    // ── Pallet cargo indicator (inbound robot carrying a pallet) ─────────
+    final cargoOnRobot = robotCargo[robot.id];
+    if (cargoOnRobot != null) {
+      final palletCenter = c + Offset(0, r * 0.05);
+      // Orange pallet platform
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromCenter(
+              center: palletCenter, width: bodyW * 0.68, height: bodyH * 0.40),
+          Radius.circular(r * 0.06),
+        ),
+        Paint()..color = const Color(0xFFD97706),
+      );
+      // Pallet planks (horizontal lines)
+      final plankPaint = Paint()
+        ..color = const Color(0xFF92400E)
+        ..strokeWidth = max(0.8, r * 0.08);
+      final plankY1 = palletCenter.dy - bodyH * 0.10;
+      final plankY2 = palletCenter.dy + bodyH * 0.10;
+      for (final py in [plankY1, plankY2]) {
+        canvas.drawLine(
+          Offset(c.dx - bodyW * 0.30, py),
+          Offset(c.dx + bodyW * 0.30, py),
+          plankPaint,
+        );
+      }
+      // SKU label on pallet
+      if (r > 6) {
+        final sku = cargoOnRobot.skuId;
+        final skuShort = sku.length > 8 ? sku.substring(sku.length - 8) : sku;
+        _drawTextCentered(
+            canvas, skuShort, palletCenter, (r * 0.28).clamp(5.0, 10.0),
+            color: Colors.white);
       }
     }
 
@@ -2226,15 +2959,18 @@ class FloorPainter extends CustomPainter {
     tp.paint(canvas, Offset(pos.dx - tp.width / 2, pos.dy));
   }
 
-  Color _robotColor(Robot robot) => switch (robot.state) {
-        'PICKING' => const Color(0xFF00FF88),
-        'CHARGING' => const Color(0xFFFFCC00),
-        'ERROR' => const Color(0xFFFF4444),
-        'MOVING' => const Color(0xFF00AAFF),
-        _ => robot.type == 'AGV'
-            ? const Color(0xFF8B949E)
-            : const Color(0xFF00D4FF),
-      };
+  Color _robotColor(Robot robot) {
+    if (robotCargo[robot.id] != null)
+      return const Color(0xFFFF9800); // amber = carrying pallet
+    return switch (robot.state) {
+      'PICKING' => const Color(0xFF00FF88),
+      'CHARGING' => const Color(0xFFFFCC00),
+      'ERROR' => const Color(0xFFFF4444),
+      'MOVING' => const Color(0xFF00AAFF),
+      _ =>
+        robot.type == 'AGV' ? const Color(0xFF8B949E) : const Color(0xFF00D4FF),
+    };
+  }
 }
 
 // ── D-pad overlay for manual robot control ─────────────────────────────────

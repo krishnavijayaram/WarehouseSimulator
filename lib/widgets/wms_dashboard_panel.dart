@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/api_client.dart';
+import '../core/sim_ws.dart';
 import '../application/providers.dart';
 import '../models/warehouse_config.dart';
 
@@ -66,6 +67,19 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Listen to inboundTrucksProvider: whenever a pick/drop updates the truck
+    // data, immediately re-fetch the WMS dashboard so staging counts refresh
+    // without waiting for the 10 s timer.
+    ref.listen<AsyncValue<InboundTruckData>>(inboundTrucksProvider, (_, next) {
+      if (next is AsyncData) {
+        _fetch();
+      }
+    });
+  }
+
+  @override
   void didUpdateWidget(_ScoutingPanel old) {
     super.didUpdateWidget(old);
     // Warehouse was re-published with a new ID — reset and re-check.
@@ -113,11 +127,28 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
         });
       }
     } catch (e) {
-      if (mounted)
-        setState(() {
-          _loading = false;
-          _fetchError = e.toString();
-        });
+      // Fall back to a local snapshot for 404 (warehouse not yet in DB) and
+      // connection errors so the panel stays useful even when the backend is
+      // unreachable or the warehouse hasn't been published yet.
+      final isNetworkOrNotFound = e is ApiException
+          ? (e.statusCode == 404 || e.statusCode == 0)
+          : true; // SocketException / TimeoutException etc.
+      if (mounted) {
+        if (isNetworkOrNotFound) {
+          final localData = _buildLocalSnapshot(
+              widget.config, ref.read(exploredCellsProvider));
+          setState(() {
+            _data = localData;
+            _loading = false;
+            _fetchError = null;
+          });
+        } else {
+          setState(() {
+            _loading = false;
+            _fetchError = e.toString();
+          });
+        }
+      }
     }
   }
 
@@ -185,6 +216,15 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
   Widget build(BuildContext context) {
     final explored = ref.watch(exploredCellsProvider);
     final opsStarted = ref.watch(operationsStartedProvider);
+    final cargoMap = ref.watch(robotCargoProvider);
+    // Build a robotId → name lookup from the live frame
+    final frameRobots = ref.watch(simFrameProvider).robots;
+    final robotNameById = {for (final r in frameRobots) r.id: r.name};
+    // Live truck data (kept in sync: invalidated after every PICK)
+    final trucksData = ref.watch(inboundTrucksProvider);
+    final inboundTrucks = trucksData.valueOrNull?.trucks ?? const [];
+    final shipmentsByTruck =
+        trucksData.valueOrNull?.shipmentsByTruck ?? const {};
 
     // ── Decide what data to display ──────────────────────────────────────────
     // When ops are running we ALWAYS derive exploration from local Riverpod
@@ -222,58 +262,12 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
       isLocalMode = false;
     }
 
-    if (displayData == null) {
-      if (_loading) {
-        return const Padding(
-          padding: EdgeInsets.symmetric(vertical: 16),
-          child: Center(
-            child: SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(
-                color: Color(0xFF00D4FF),
-                strokeWidth: 2,
-              ),
-            ),
-          ),
-        );
-      }
-      if (_fetchError != null) {
-        return Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              const Icon(Icons.cloud_off_rounded,
-                  size: 14, color: Color(0xFFFF4444)),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Could not reach backend: $_fetchError',
-                  style:
-                      const TextStyle(fontSize: 10, color: Color(0xFFFF4444)),
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.refresh,
-                    size: 14, color: Color(0xFF8B949E)),
-                onPressed: () {
-                  _fetchWarehouseStatus();
-                  _fetch();
-                },
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-              ),
-            ],
-          ),
-        );
-      }
-      return const SizedBox.shrink();
-    }
-
     final exploration =
         (displayData['exploration'] as Map?)?.cast<String, dynamic>() ?? {};
     final inventory =
         (displayData['inventory'] as Map?)?.cast<String, dynamic>() ?? {};
+    // Staging data only comes from the backend (no local equivalent)
+    final staging = (_data?['staging'] as Map?)?.cast<String, dynamic>() ?? {};
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
@@ -295,6 +289,23 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
                 ],
               ),
             ),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 6),
+              child: LinearProgressIndicator(
+                minHeight: 1,
+                backgroundColor: Color(0xFF21262D),
+                color: Color(0xFF00D4FF),
+              ),
+            ),
+          if (_fetchError != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text(
+                '⚠ $_fetchError',
+                style: const TextStyle(color: Color(0xFFFF4444), fontSize: 9),
+              ),
+            ),
           if (_whChecked && !isLocalMode)
             _WarehouseStatusChip(
               warehouseId: widget.config.id,
@@ -308,6 +319,31 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
           const _PanelHeader('Layout Discovery'),
           WmsExplorationCard(exploration),
           const SizedBox(height: 14),
+          // ── Inbound Trucks (remaining / total per SKU) ──────────────────
+          if (inboundTrucks.isNotEmpty) ...[
+            const _PanelHeader('Inbound Trucks'),
+            ...inboundTrucks.map((t) {
+              final tid = t['truck_id'] as String? ?? '';
+              return _WmsTruckCard(
+                truck: t,
+                shipments: shipmentsByTruck[tid] ?? const [],
+              );
+            }),
+            const SizedBox(height: 14),
+          ],
+          // ── Robots in transit (carrying a pallet right now) ─────────────
+          if (cargoMap.isNotEmpty) ...[
+            const _PanelHeader('Inbound Robot On-Hand'),
+            _InTransitCard(cargoMap: cargoMap, robotNameById: robotNameById),
+            const SizedBox(height: 14),
+          ],
+          // ── Staging buffer (shows pallets received but not yet putaway) ────
+          if (!opsStarted ||
+              (staging['total_pallets_staged'] as int? ?? 0) > 0) ...[
+            const _PanelHeader('Inbound Staging'),
+            _StagingCard(staging),
+            const SizedBox(height: 14),
+          ],
           const _PanelHeader('WMS Inventory'),
           WmsInventoryCard(inventory),
           const SizedBox(height: 24),
@@ -776,6 +812,374 @@ class _InventoryRow extends StatelessWidget {
                   fontFamily: 'ShareTechMono'),
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+// ── Compact Truck Card (WMS panel — remaining/total per SKU) ─────────────────
+
+class _WmsTruckCard extends StatelessWidget {
+  const _WmsTruckCard({required this.truck, required this.shipments});
+  final Map<String, dynamic> truck;
+  final List<Map<String, dynamic>> shipments;
+
+  @override
+  Widget build(BuildContext context) {
+    final truckId = truck['truck_id'] as String? ?? '?';
+    final status = truck['status_actual'] as String? ?? '?';
+    final statusColor = switch (status) {
+      'ENROUTE' => const Color(0xFFFFCC00),
+      'ARRIVED' || 'YARD_ASSIGNED' => const Color(0xFF00D4FF),
+      'WAITING' || 'UNLOADING' => const Color(0xFF00FF88),
+      _ => const Color(0xFF8B949E),
+    };
+
+    // Group shipments by SKU
+    final grouped = <String, ({int expected, int remaining})>{};
+    for (final s in shipments) {
+      final sku = s['sku_id'] as String? ?? '?';
+      final exp = (s['qty_expected'] as num? ?? 0).toInt();
+      final rem = (s['qty_remaining'] as num? ?? 0).toInt();
+      final cur = grouped[sku];
+      grouped[sku] = (
+        expected: (cur?.expected ?? 0) + exp,
+        remaining: (cur?.remaining ?? 0) + rem,
+      );
+    }
+
+    // Use pre-computed pallet counts from API (qty_pallets_expected / qty_pallets_remaining).
+    // These are normalised server-side regardless of which creation path produced the shipment.
+    final totalExpPal = shipments.fold<int>(
+        0, (s, e) => s + ((e['qty_pallets_expected'] as num? ?? 0).toInt()));
+    final totalRemPal = shipments.fold<int>(
+        0, (s, e) => s + ((e['qty_pallets_remaining'] as num? ?? 0).toInt()));
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: statusColor.withAlpha(60)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Header row ────────────────────────────────────────────────
+          Row(children: [
+            const Icon(Icons.local_shipping_outlined,
+                size: 11, color: Color(0xFF8B949E)),
+            const SizedBox(width: 5),
+            Expanded(
+              child: Text(
+                truckId,
+                style: const TextStyle(
+                    fontSize: 10,
+                    color: Color(0xFFE6EDF3),
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'ShareTechMono'),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              decoration: BoxDecoration(
+                color: statusColor.withAlpha(20),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(status,
+                  style: TextStyle(
+                      fontSize: 8,
+                      color: statusColor,
+                      fontWeight: FontWeight.bold)),
+            ),
+            if (totalExpPal > 0) ...[
+              const SizedBox(width: 8),
+              RichText(
+                text: TextSpan(
+                  style: const TextStyle(
+                      fontSize: 10, fontWeight: FontWeight.bold),
+                  children: [
+                    TextSpan(
+                      text: '$totalRemPal',
+                      style: TextStyle(
+                          color: totalRemPal < totalExpPal
+                              ? const Color(0xFFFFCC00)
+                              : const Color(0xFF00D4FF)),
+                    ),
+                    const TextSpan(
+                      text: ' / ',
+                      style: TextStyle(color: Color(0xFF484F58)),
+                    ),
+                    TextSpan(
+                      text: '$totalExpPal pal',
+                      style: const TextStyle(color: Color(0xFF484F58)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ]),
+          // ── Per-SKU rows ──────────────────────────────────────────────
+          if (grouped.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            const Divider(color: Color(0xFF30363D), height: 1),
+            const SizedBox(height: 5),
+            ...grouped.entries.map((e) {
+              // Find pallet counts from the raw shipment list for this SKU
+              final skuShipments =
+                  shipments.where((s) => s['sku_id'] == e.key).toList();
+              final expPal = skuShipments.fold<int>(
+                  0,
+                  (s, x) =>
+                      s + ((x['qty_pallets_expected'] as num? ?? 0).toInt()));
+              final remPal = skuShipments.fold<int>(
+                  0,
+                  (s, x) =>
+                      s + ((x['qty_pallets_remaining'] as num? ?? 0).toInt()));
+              final picked = expPal - remPal;
+              final fill = e.value.expected > 0
+                  ? e.value.remaining / e.value.expected
+                  : 1.0;
+              final countColor = picked > 0
+                  ? const Color(0xFFFFCC00)
+                  : const Color(0xFF00D4FF);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 5),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(children: [
+                      const Text('📦', style: TextStyle(fontSize: 10)),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          e.key,
+                          style: const TextStyle(
+                              fontSize: 9, color: Color(0xFFCDD9E5)),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      RichText(
+                        text: TextSpan(
+                          style: const TextStyle(
+                              fontSize: 10, fontWeight: FontWeight.bold),
+                          children: [
+                            TextSpan(
+                              text: '$remPal',
+                              style: TextStyle(color: countColor),
+                            ),
+                            const TextSpan(
+                              text: ' / ',
+                              style: TextStyle(color: Color(0xFF484F58)),
+                            ),
+                            TextSpan(
+                              text: '$expPal pal',
+                              style: const TextStyle(color: Color(0xFF484F58)),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (picked > 0) ...[
+                        const SizedBox(width: 6),
+                        Text(
+                          '−$picked',
+                          style: const TextStyle(
+                              fontSize: 9, color: Color(0xFFFF8800)),
+                        ),
+                      ],
+                    ]),
+                    const SizedBox(height: 2),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: fill,
+                        minHeight: 2,
+                        backgroundColor: const Color(0xFF21262D),
+                        valueColor: AlwaysStoppedAnimation<Color>(countColor),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ── In-Transit Card (robots currently carrying a pallet) ─────────────────────
+
+class _InTransitCard extends StatelessWidget {
+  const _InTransitCard({required this.cargoMap, required this.robotNameById});
+  final Map<String, PalletData> cargoMap;
+  final Map<String, String> robotNameById;
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = cargoMap.entries.toList();
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFFFF8800).withAlpha(80)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.precision_manufacturing,
+                size: 13, color: Color(0xFFFF8800)),
+            const SizedBox(width: 6),
+            Text(
+              '${entries.length} robot${entries.length == 1 ? '' : 's'} carrying',
+              style: const TextStyle(
+                  fontSize: 12,
+                  color: Color(0xFFFF8800),
+                  fontWeight: FontWeight.bold),
+            ),
+            const Spacer(),
+            const Text(
+              'IN TRANSIT',
+              style: TextStyle(
+                  fontSize: 8, color: Color(0xFF8B949E), letterSpacing: 1),
+            ),
+          ]),
+          const SizedBox(height: 8),
+          const Divider(color: Color(0xFF30363D), height: 1),
+          const SizedBox(height: 6),
+          ...entries.map((e) {
+            final name = robotNameById[e.key] ?? e.key;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 5),
+              child: Row(children: [
+                const Icon(Icons.smart_toy_outlined,
+                    size: 11, color: Color(0xFFFF8800)),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    name,
+                    style:
+                        const TextStyle(fontSize: 10, color: Color(0xFFE6EDF3)),
+                  ),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF8800).withAlpha(20),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                        color: const Color(0xFFFF8800).withAlpha(60)),
+                  ),
+                  child: Text(
+                    e.value.skuId,
+                    style: const TextStyle(
+                        fontSize: 9,
+                        color: Color(0xFFFF8800),
+                        fontFamily: 'ShareTechMono',
+                        fontWeight: FontWeight.bold),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  e.value.truckId,
+                  style: const TextStyle(fontSize: 9, color: Color(0xFF8B949E)),
+                ),
+              ]),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+}
+// ── Inbound Staging Card ─────────────────────────────────────────────────────
+
+class _StagingCard extends StatelessWidget {
+  const _StagingCard(this.staging);
+  final Map<String, dynamic> staging;
+
+  @override
+  Widget build(BuildContext context) {
+    final total = (staging['total_pallets_staged'] as num? ?? 0).toInt();
+    final items =
+        (staging['items'] as List? ?? []).cast<Map<String, dynamic>>();
+
+    if (total == 0) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF161B22),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFF30363D)),
+        ),
+        child: const Row(children: [
+          Icon(Icons.inventory_2_outlined, size: 14, color: Color(0xFF8B949E)),
+          SizedBox(width: 6),
+          Text(
+            'No pallets in staging — unload a truck to receive goods',
+            style: TextStyle(fontSize: 10, color: Color(0xFF8B949E)),
+          ),
+        ]),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF00FF88).withAlpha(60)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Text('📦', style: TextStyle(fontSize: 14)),
+            const SizedBox(width: 6),
+            Text(
+              '$total pallet${total == 1 ? '' : 's'} staged',
+              style: const TextStyle(
+                  fontSize: 13,
+                  color: Color(0xFF00FF88),
+                  fontWeight: FontWeight.bold),
+            ),
+            const Spacer(),
+            const Text(
+              'AWAITING PUTAWAY',
+              style: TextStyle(
+                  fontSize: 8, color: Color(0xFF8B949E), letterSpacing: 1),
+            ),
+          ]),
+          if (items.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Divider(color: Color(0xFF30363D), height: 1),
+            const SizedBox(height: 6),
+            ...items.map((e) => Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Row(children: [
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        e['sku_id'] as String? ?? '?',
+                        style: const TextStyle(
+                            fontSize: 10, color: Color(0xFFE6EDF3)),
+                      ),
+                    ),
+                    Text(
+                      '${e['pallets_staged']} pallet'
+                      '${(e['pallets_staged'] as num? ?? 0) == 1 ? '' : 's'}',
+                      style: const TextStyle(
+                          fontSize: 10, color: Color(0xFF00D4FF)),
+                    ),
+                  ]),
+                )),
+          ],
         ],
       ),
     );

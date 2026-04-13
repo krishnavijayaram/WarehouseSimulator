@@ -457,7 +457,7 @@ class _WarehouseCreatorScreenState
       debugPrint('⚠️  Backend warehouse publish failed (offline mode): $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
+          content: const Text(
               'Backend offline — exploring in local mode.\nInventory will sync when the backend is available.'),
           backgroundColor: const Color(0xFF1C3A4F),
           duration: const Duration(seconds: 5),

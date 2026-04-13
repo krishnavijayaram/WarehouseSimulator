@@ -156,6 +156,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         children: [
           const ConnectionBanner(),
 
+          // ── WIP notice ───────────────────────────────────────────────────
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            color: const Color(0xFF0F2010),
+            child: Row(
+              children: [
+                const Text('🚧', style: TextStyle(fontSize: 13)),
+                const SizedBox(width: 8),
+                const Text(
+                  'Work in Progress — AI responses may be incomplete.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF4ADE80),
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
           // ── Message list ─────────────────────────────────────────────────
           Expanded(
             child: !_initialised

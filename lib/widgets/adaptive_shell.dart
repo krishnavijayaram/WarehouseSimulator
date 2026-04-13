@@ -17,8 +17,10 @@ import '../models/sim_frame.dart';
 import '../models/warehouse_config.dart';
 import '../screens/about_screen.dart';
 import '../screens/community_screen.dart';
+import '../screens/dashboard_screen.dart' show TruckFleetCard;
 import '../screens/floor_screen.dart';
 import '../screens/game_screen.dart';
+import '../screens/orders_screen.dart';
 import '../screens/warehouse_creator_screen.dart';
 import '../application/providers.dart';
 import '../widgets/robot_card.dart';
@@ -50,7 +52,7 @@ const _text = Color(0xFFE6EDF3);
 
 // ── Personas ──────────────────────────────────────────────────────────────────
 
-const _personas = ['Manager', 'Supervisor', 'Examiner', 'Demo'];
+const _personas = ['Manager', 'Supervisor', 'Examiner', 'Demo', 'Sabotager'];
 
 const _personaQuestions = {
   'Manager': [
@@ -80,6 +82,13 @@ const _personaQuestions = {
     'Show me an interesting anomaly.',
     'How does the AI assistant work?',
     'What does the sync status mean?',
+  ],
+  'Sabotager': [
+    'Which cells are most vulnerable?',
+    'How long before a blocked charger is detected?',
+    'What happens if I scramble an aisle path?',
+    'Which robot is easiest to strand?',
+    'What is the maximum disruption I can cause?',
   ],
 };
 
@@ -115,6 +124,7 @@ class AdaptiveShell extends ConsumerStatefulWidget {
 
 class _AdaptiveShellState extends ConsumerState<AdaptiveShell> {
   int _selectedIndex = 0;
+  bool _cargoHydrated = false;
 
   @override
   void initState() {
@@ -133,6 +143,10 @@ class _AdaptiveShellState extends ConsumerState<AdaptiveShell> {
             icon: Icon(Icons.grid_view_outlined),
             selectedIcon: Icon(Icons.grid_view),
             label: 'Floor'),
+        const NavigationDestination(
+            icon: Icon(Icons.swap_horiz_outlined),
+            selectedIcon: Icon(Icons.swap_horiz),
+            label: 'Orders'),
         const NavigationDestination(
             icon: Icon(Icons.chat_bubble_outline),
             selectedIcon: Icon(Icons.chat_bubble),
@@ -161,6 +175,17 @@ class _AdaptiveShellState extends ConsumerState<AdaptiveShell> {
       if (next != null) {
         setState(() => _selectedIndex = next);
         ref.read(navigateToTabProvider.notifier).state = null;
+      }
+    });
+
+    // ── Transactional cargo hydration ────────────────────────────────────────
+    // Re-hydrate robotCargoProvider from the backend RobotHolding table the
+    // first time liveRobots data arrives. This ensures cargo is never lost
+    // after a page refresh — the backend is the source of truth.
+    ref.listen<AsyncValue<List<Robot>>>(liveRobotsProvider, (_, next) {
+      if (!_cargoHydrated && next.valueOrNull?.isNotEmpty == true) {
+        _cargoHydrated = true;
+        ref.read(robotCargoProvider.notifier).hydrateFromBackend();
       }
     });
 
@@ -214,7 +239,9 @@ class _DesktopLayoutState extends ConsumerState<_DesktopLayout> {
   double _rightWidth = 360;
   static const _minRight = 260.0;
   static const _maxRight = 560.0;
+  static const _collapsedRight = 48.0;
   int _navIndex = 0;
+  bool _chatMinimised = false;
 
   List<NavigationRailDestination> get _railDests => [
         const NavigationRailDestination(
@@ -225,6 +252,10 @@ class _DesktopLayoutState extends ConsumerState<_DesktopLayout> {
             icon: Icon(Icons.grid_view_outlined),
             selectedIcon: Icon(Icons.grid_view),
             label: Text('FLOOR')),
+        const NavigationRailDestination(
+            icon: Icon(Icons.swap_horiz_outlined),
+            selectedIcon: Icon(Icons.swap_horiz),
+            label: Text('ORDERS')),
         const NavigationRailDestination(
             icon: Icon(Icons.warehouse_outlined),
             selectedIcon: Icon(Icons.warehouse),
@@ -285,30 +316,38 @@ class _DesktopLayoutState extends ConsumerState<_DesktopLayout> {
           ),
 
           // ── Draggable splitter ─────────────────────────────────────────────
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onHorizontalDragUpdate: (d) {
-              setState(() {
-                _rightWidth =
-                    (_rightWidth - d.delta.dx).clamp(_minRight, _maxRight);
-              });
-            },
-            child: MouseRegion(
-              cursor: SystemMouseCursors.resizeColumn,
-              child: Container(
-                width: 6,
-                color: _border,
-                child: const Center(
-                  child: Icon(Icons.drag_indicator, size: 14, color: _muted),
+          if (!_chatMinimised)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (d) {
+                setState(() {
+                  _rightWidth =
+                      (_rightWidth - d.delta.dx).clamp(_minRight, _maxRight);
+                });
+              },
+              child: MouseRegion(
+                cursor: SystemMouseCursors.resizeColumn,
+                child: Container(
+                  width: 6,
+                  color: _border,
+                  child: const Center(
+                    child: Icon(Icons.drag_indicator, size: 14, color: _muted),
+                  ),
                 ),
               ),
             ),
-          ),
 
           // ── Right panel ─────────────────────────────────────────────────────
-          SizedBox(
-            width: _rightWidth,
-            child: _RightChatPanel(user: widget.user),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeInOut,
+            width: _chatMinimised ? _collapsedRight : _rightWidth,
+            child: _RightChatPanel(
+              user: widget.user,
+              minimised: _chatMinimised,
+              onToggleMinimise: () =>
+                  setState(() => _chatMinimised = !_chatMinimised),
+            ),
           ),
         ],
       ),
@@ -318,10 +357,11 @@ class _DesktopLayoutState extends ConsumerState<_DesktopLayout> {
   Widget _leftContent() {
     return switch (_navIndex) {
       1 => const FloorCanvas(),
-      2 => const WarehouseCreatorScreen(),
-      3 => const AboutScreen(),
-      4 => const CommunityScreen(),
-      5 => const GameScreen(),
+      2 => const OrdersScreen(),
+      3 => const WarehouseCreatorScreen(),
+      4 => const AboutScreen(),
+      5 => const CommunityScreen(),
+      6 => const GameScreen(),
       _ => Column(
           children: [
             Expanded(
@@ -552,9 +592,13 @@ class _DataTabs extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     // Live robots from DB (polls every 3 s); falls back to empty list.
     final robots = ref.watch(liveRobotsProvider).valueOrNull ?? const [];
+    final truckData = ref.watch(inboundTrucksProvider);
+    final inboundTrucks = truckData.valueOrNull?.trucks ?? const [];
+    final shipmentsByTruck =
+        truckData.valueOrNull?.shipmentsByTruck ?? const {};
 
     return DefaultTabController(
-      length: 11,
+      length: 12,
       child: Column(
         children: [
           Container(
@@ -565,6 +609,7 @@ class _DataTabs extends ConsumerWidget {
               unselectedLabelColor: _muted,
               tabs: [
                 Tab(text: '🤖 FLEET'),
+                Tab(text: '🚛 TRUCKS'),
                 Tab(text: '📍 WMS'),
                 Tab(text: '📦 ORDERS'),
                 Tab(text: '🌊 WAVES'),
@@ -582,6 +627,8 @@ class _DataTabs extends ConsumerWidget {
             child: TabBarView(
               children: [
                 _FleetTab(robots: robots),
+                _TrucksTab(
+                    trucks: inboundTrucks, shipmentsByTruck: shipmentsByTruck),
                 const WmsDashboardPanel(),
                 _OrdersTab(frame: frame),
                 _WavesTab(frame: frame),
@@ -603,20 +650,52 @@ class _DataTabs extends ConsumerWidget {
 
 // ── Fleet Tab ─────────────────────────────────────────────────────────────────
 
-class _FleetTab extends StatelessWidget {
+class _FleetTab extends ConsumerWidget {
   const _FleetTab({required this.robots});
   final List<Robot> robots;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (robots.isEmpty) {
       return const _EmptyTab(
           'No robots online yet.\nStart Operations and move a robot.');
     }
+    final cargoMap = ref.watch(robotCargoProvider);
     return ListView.builder(
       padding: const EdgeInsets.all(8),
       itemCount: robots.length,
-      itemBuilder: (_, i) => RobotCard(robot: robots[i]),
+      itemBuilder: (_, i) => RobotCard(
+        robot: robots[i],
+        cargo: cargoMap[robots[i].id],
+      ),
+    );
+  }
+}
+
+// ── Trucks Tab ────────────────────────────────────────────────────────────────
+
+class _TrucksTab extends StatelessWidget {
+  const _TrucksTab({required this.trucks, required this.shipmentsByTruck});
+  final List<Map<String, dynamic>> trucks;
+  final Map<String, List<Map<String, dynamic>>> shipmentsByTruck;
+
+  @override
+  Widget build(BuildContext context) {
+    if (trucks.isEmpty) {
+      return const _EmptyTab(
+          'No inbound trucks on road.\nDispatch an order to see trucks here.');
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(8),
+      itemCount: trucks.length,
+      itemBuilder: (_, i) {
+        final t = trucks[i];
+        final tid = t['truck_id'] as String? ?? '';
+        return TruckFleetCard(
+          truck: t,
+          shipments: shipmentsByTruck[tid] ?? const [],
+        );
+      },
     );
   }
 }
@@ -1289,8 +1368,14 @@ class _SyncBarsStrip extends StatelessWidget {
 // ══════════════════════════════════════════════════════════════════════════════
 
 class _RightChatPanel extends ConsumerStatefulWidget {
-  const _RightChatPanel({required this.user});
+  const _RightChatPanel({
+    required this.user,
+    this.minimised = false,
+    this.onToggleMinimise,
+  });
   final WoisUser? user;
+  final bool minimised;
+  final VoidCallback? onToggleMinimise;
 
   @override
   ConsumerState<_RightChatPanel> createState() => _RightChatPanelState();
@@ -1410,6 +1495,45 @@ class _RightChatPanelState extends ConsumerState<_RightChatPanel> {
   @override
   Widget build(BuildContext context) {
     final questions = _personaQuestions[_persona] ?? [];
+    // When minimised on desktop, show only the header bar rotated as a
+    // vertical strip with the chevron to restore.
+    if (widget.minimised) {
+      return Container(
+        color: _surface,
+        child: Column(
+          children: [
+            const Divider(height: 1, color: _border),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (widget.onToggleMinimise != null)
+                    IconButton(
+                      icon: const Icon(Icons.chevron_right,
+                          size: 18, color: _cyan),
+                      tooltip: 'Expand chat',
+                      onPressed: widget.onToggleMinimise,
+                    ),
+                  const SizedBox(height: 8),
+                  const RotatedBox(
+                    quarterTurns: 1,
+                    child: Text(
+                      'AI ASSISTANT',
+                      style: TextStyle(
+                          fontSize: 9,
+                          color: _muted,
+                          letterSpacing: 1.5,
+                          fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     return Container(
       color: _bg,
       child: Column(
@@ -1446,6 +1570,25 @@ class _RightChatPanelState extends ConsumerState<_RightChatPanel> {
                     shape: BoxShape.circle,
                   ),
                 ),
+                const SizedBox(width: 6),
+                if (widget.onToggleMinimise != null)
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      icon: Icon(
+                        widget.minimised
+                            ? Icons.chevron_right
+                            : Icons.chevron_left,
+                        size: 16,
+                        color: _muted,
+                      ),
+                      tooltip:
+                          widget.minimised ? 'Expand chat' : 'Collapse chat',
+                      onPressed: widget.onToggleMinimise,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -1461,7 +1604,10 @@ class _RightChatPanelState extends ConsumerState<_RightChatPanel> {
               children: [
                 for (final p in _personas) ...[
                   GestureDetector(
-                    onTap: () => setState(() => _persona = p),
+                    onTap: () {
+                      setState(() => _persona = p);
+                      ref.read(selectedPersonaProvider.notifier).state = p;
+                    },
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 150),
                       padding: const EdgeInsets.symmetric(
@@ -1487,6 +1633,31 @@ class _RightChatPanelState extends ConsumerState<_RightChatPanel> {
                   ),
                   const SizedBox(width: 4),
                 ],
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: _border),
+
+          // ── WIP notice ───────────────────────────────────────────────────────
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            color: const Color(0xFF0B1A0B),
+            child: Row(
+              children: const [
+                Text('🚧', style: TextStyle(fontSize: 11)),
+                SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'Work in Progress — responses may be incomplete.',
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: Color(0xFF4ADE80),
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -1827,6 +1998,9 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
   // Keyboard focus for arrow-key robot control
   final FocusNode _focusNode = FocusNode();
 
+  // Inbound truck state
+  String? _selectedTruckId;
+
   @override
   void initState() {
     super.initState();
@@ -1929,7 +2103,8 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
   }
 
   // ── Build smart context menu based on what is under the cursor ─────────────
-  void _showContextMenu(BuildContext ctx, Offset globalPos, Offset localPos) {
+  void _showContextMenu(BuildContext ctx, Offset globalPos, Offset localPos,
+      [List<Robot> displayRobots = const []]) {
     final RenderBox renderBox = ctx.findRenderObject() as RenderBox;
     final canvasSize = renderBox.size;
     final hit = _cellAt(localPos, canvasSize);
@@ -1939,12 +2114,15 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
     final cell = config?.cellAt(hit.row, hit.col);
     final cellType = cell?.type ?? CellType.empty;
 
-    // Robot at this cell?
-    final robot = frame.robots
-        .where(
-          (r) => r.x.round() == hit.col && r.y.round() == hit.row,
-        )
-        .firstOrNull;
+    // Gate sabotage menu items to the 'Sabotager' chatbot persona only.
+    final isSabotager = ref.read(selectedPersonaProvider) == 'Sabotager';
+
+    // Use displayRobots (same list rendered on screen) for robot detection.
+    // Falls back to frame.robots if not passed in.
+    final searchList = displayRobots.isNotEmpty ? displayRobots : frame.robots;
+
+    // Robot at this cell? Use radius-based detection (same as tap handler).
+    final robot = _robotAtLocal(localPos, searchList);
 
     final RenderBox overlay =
         Overlay.of(ctx).context.findRenderObject() as RenderBox;
@@ -1980,6 +2158,57 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
             child: _MenuItem(Icons.pause_circle_outline, 'Pause Robot', _red)),
         const PopupMenuDivider(),
       ]);
+
+      // ─── Pallet load / drop actions — available to ANY robot ────────────
+      // Step 2: Robot next to docked truck, not carrying anything → Unload.
+      // Step 3: Robot carrying a pallet, next to staging → Drop.
+      final cargoMap = ref.read(robotCargoProvider);
+      final _ctxDbId = _resolveDbRobotId(robot.id);
+      final pallet = cargoMap[_ctxDbId];
+      if (pallet == null) {
+        // No pallet loaded — show Unload option if adjacent to a docked truck.
+        final trucks =
+            ref.read(inboundTrucksProvider).valueOrNull?.trucks ?? [];
+        final nearTruck = config != null &&
+            _hasDockedTruckAdjacent(hit.row, hit.col, config, trucks);
+        if (nearTruck) {
+          items.add(const PopupMenuItem(
+            value: 'unload_truck',
+            child: _MenuItem(Icons.local_shipping_outlined,
+                'Unload Truck → Load Pallet', _cyan),
+          ));
+          items.add(const PopupMenuDivider());
+        }
+      } else {
+        // Carrying a pallet — always show status + drop option.
+        items.add(PopupMenuItem<String>(
+          enabled: false,
+          height: 28,
+          child: Text(
+            '  🏗 Carrying: ${pallet.skuId}  [from ${pallet.truckId}]',
+            style: const TextStyle(fontSize: 10, color: _yellow),
+          ),
+        ));
+        final nearStaging = config != null &&
+            _adjacentStagingCell(hit.row, hit.col, config) != null;
+        if (nearStaging) {
+          items.add(const PopupMenuItem(
+            value: 'drop_pallet',
+            child: _MenuItem(
+                Icons.download_done, 'Drop Pallet at Staging', _yellow),
+          ));
+        } else {
+          items.add(const PopupMenuItem<String>(
+            enabled: false,
+            height: 24,
+            child: Text(
+              '  → Navigate robot adjacent to Pallet Staging cell',
+              style: TextStyle(fontSize: 9, color: _muted),
+            ),
+          ));
+        }
+        items.add(const PopupMenuDivider());
+      }
     }
 
     // ─── Component-specific inspect actions ────────────────────────────────
@@ -1993,11 +2222,20 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
           const PopupMenuItem(
               value: 'inspect_aisle',
               child: _MenuItem(Icons.grid_view, 'View Aisle', _text)),
-          const PopupMenuItem(
-              value: 'place_obstacle',
-              child: _MenuItem(Icons.block, 'Place Obstacle', _red)),
+          if (isSabotager)
+            const PopupMenuItem(
+                value: 'place_obstacle',
+                child: _MenuItem(Icons.block, 'Place Obstacle', _red)),
         ]);
       case CellType.dock:
+        // Step 1: Move ENROUTE truck to this bay.
+        final enrouteTrucks = (ref
+                    .read(inboundTrucksProvider)
+                    .valueOrNull
+                    ?.trucks ??
+                const [])
+            .where((t) => (t['status_actual'] as String? ?? '') == 'ENROUTE')
+            .toList();
         items.addAll([
           const PopupMenuItem(
               value: 'inspect_dock',
@@ -2007,12 +2245,29 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
               value: 'inspect_packing',
               child: _MenuItem(
                   Icons.inventory_2_outlined, 'View Packing Progress', _text)),
+          if (enrouteTrucks.isNotEmpty)
+            const PopupMenuItem(
+                value: 'move_truck_to_bay',
+                child: _MenuItem(
+                    Icons.directions_car, 'Move Truck → Inbound Bay', _green)),
         ]);
       case CellType.inbound:
+        final enrouteTrucksInbound = (ref
+                    .read(inboundTrucksProvider)
+                    .valueOrNull
+                    ?.trucks ??
+                const [])
+            .where((t) => (t['status_actual'] as String? ?? '') == 'ENROUTE')
+            .toList();
         items.addAll([
           const PopupMenuItem(
               value: 'inspect_inbound',
               child: _MenuItem(Icons.input, 'View Inbound Queue', _cyan)),
+          if (enrouteTrucksInbound.isNotEmpty)
+            const PopupMenuItem(
+                value: 'move_truck_to_bay',
+                child: _MenuItem(
+                    Icons.directions_car, 'Move Truck → Inbound Bay', _green)),
           const PopupMenuItem(
               value: 'trigger_receiving',
               child: _MenuItem(
@@ -2033,10 +2288,11 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
           const PopupMenuItem(
               value: 'inspect_charging',
               child: _MenuItem(Icons.bolt, 'View Charging Station', _yellow)),
-          const PopupMenuItem(
-              value: 'block_charger',
-              child:
-                  _MenuItem(Icons.power_off, 'Sabotage: Block Charger', _red)),
+          if (isSabotager)
+            const PopupMenuItem(
+                value: 'block_charger',
+                child: _MenuItem(
+                    Icons.power_off, 'Sabotage: Block Charger', _red)),
         ]);
       case CellType.packStation || CellType.labelStation:
         items.addAll([
@@ -2061,12 +2317,15 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
               value: 'inspect_aisle',
               child:
                   _MenuItem(Icons.view_column_outlined, 'View Aisle', _cyan)),
-          const PopupMenuItem(
-              value: 'place_obstacle',
-              child: _MenuItem(Icons.block, 'Place Obstacle', _red)),
-          const PopupMenuItem(
-              value: 'scramble_path',
-              child: _MenuItem(Icons.route, 'Scramble Path (Sabotage)', _red)),
+          if (isSabotager) ...[
+            const PopupMenuItem(
+                value: 'place_obstacle',
+                child: _MenuItem(Icons.block, 'Place Obstacle', _red)),
+            const PopupMenuItem(
+                value: 'scramble_path',
+                child:
+                    _MenuItem(Icons.route, 'Scramble Path (Sabotage)', _red)),
+          ],
         ]);
       case CellType.empty:
         // Add component sub-menu items
@@ -2213,10 +2472,372 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
           });
         }
 
+      // Inbound robot pallet operations
+      case 'unload_truck':
+        _handleUnloadTruck(ctx, row, col);
+      case 'drop_pallet':
+        _handleDropPallet(ctx, row, col);
+      case 'move_truck_to_bay':
+        _handleMoveTruckToBay(ctx);
+
       // Inspect drill-in — show bottom sheet with detail
       case String s when s.startsWith('inspect_') || s == 'robot_detail':
         _showInspectSheet(ctx, val, row, col);
     }
+  }
+
+  /// Returns the pallet-staging cell at (row,col) or any of its 4 cardinal
+  /// neighbours, or null if none is found. Used so the drop-pallet menu
+  /// appears whenever the robot is standing beside (not just on) a staging slot.
+  WarehouseCell? _adjacentStagingCell(
+      int row, int col, WarehouseConfig config) {
+    const deltas = [
+      [0, 0],
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+      [0, 1],
+    ];
+    for (final d in deltas) {
+      final cell = config.cellAt(row + d[0], col + d[1]);
+      if (cell?.type == CellType.palletStaging) return cell;
+    }
+    return null;
+  }
+
+  // ── Adjacency check: is (row,col) next to a truck bay (CellType.dock) ──────
+  bool _isAdjacentToTruckBay(int row, int col, WarehouseConfig config) {
+    // Robot's own cell — sitting ON an inbound lane or dock bay counts
+    final ownType = config.cellAt(row, col)?.type;
+    if (ownType == CellType.dock || ownType == CellType.inbound) return true;
+    // 4-cardinal neighbours
+    const deltas = [
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+      [0, 1]
+    ];
+    for (final d in deltas) {
+      final nType = config.cellAt(row + d[0], col + d[1])?.type;
+      if (nType == CellType.dock || nType == CellType.inbound) return true;
+    }
+    return false;
+  }
+
+  /// Returns true only when the robot at (row,col) is standing on or directly
+  /// adjacent to a dock cell that currently has a truck parked at it.
+  /// Mirrors the slot-assignment used by _truckAtLocal / FloorPainter so the
+  /// menu matches exactly what the user sees on screen.
+  bool _hasDockedTruckAdjacent(int row, int col, WarehouseConfig config,
+      List<Map<String, dynamic>> trucks) {
+    return _adjacentTruckId(row, col, config, trucks) != null;
+  }
+
+  /// Returns the truck_id of the truck whose dock slot is adjacent to (row,col),
+  /// or null if the robot is not adjacent to any docked truck.
+  String? _adjacentTruckId(int row, int col, WarehouseConfig config,
+      List<Map<String, dynamic>> trucks) {
+    if (trucks.isEmpty) return null;
+    final allDocks =
+        config.cells.where((c) => c.type == CellType.dock).toList();
+    final inboundMarkers =
+        config.cells.where((c) => c.type == CellType.inbound).toList();
+    final cols = config.cols;
+    final double refCol = inboundMarkers.isNotEmpty
+        ? inboundMarkers.fold<double>(0.0, (s, d) => s + d.col) /
+            inboundMarkers.length
+        : (allDocks.isEmpty
+            ? 0.0
+            : allDocks.fold<double>(0.0, (s, d) => s + d.col) /
+                allDocks.length);
+    final fromLeft = (allDocks.isEmpty && inboundMarkers.isEmpty)
+        ? true
+        : refCol <= (cols / 2);
+    final dockCells = (allDocks.isNotEmpty ? allDocks : inboundMarkers)
+        .where((c) => fromLeft ? c.col <= (cols / 2) : c.col > (cols / 2))
+        .toList()
+      ..sort(
+          (a, b) => fromLeft ? a.row.compareTo(b.row) : a.col.compareTo(b.col));
+
+    int slot = 0;
+    for (final truck in trucks) {
+      final status = truck['status_actual'] as String? ?? '';
+      final isDocked = status != 'ENROUTE';
+      if (isDocked && dockCells.isNotEmpty) {
+        final dock = dockCells[slot % dockCells.length];
+        // Robot counts as adjacent if it is ON the dock cell or in any of the
+        // 4 cardinal neighbours (the inbound lane cells beside the dock).
+        const deltas = [
+          [0, 0],
+          [-1, 0],
+          [1, 0],
+          [0, -1],
+          [0, 1]
+        ];
+        for (final d in deltas) {
+          if (dock.row + d[0] == row && dock.col + d[1] == col) {
+            return truck['truck_id'] as String?;
+          }
+        }
+      }
+      slot++;
+    }
+    return null;
+  }
+
+  // ── Helper: resolve DB robot_id from display name ───────────────────────
+  // manualPositions keys are display names (e.g. 'IR-01') while the backend
+  // ledger and liveRobotsProvider use the DB id (e.g. 'rb_01').  This
+  // method bridges the two so pick/drop always use the correct DB key.
+  String _resolveDbRobotId(String displayId) {
+    final liveRobots = ref.read(liveRobotsProvider).valueOrNull ?? const [];
+    // Match by .name first (display name), then by .id (DB id) as fallback.
+    return liveRobots
+            .where((r) => r.name == displayId || r.id == displayId)
+            .map((r) => r.id)
+            .firstOrNull ??
+        displayId; // if liveRobots not yet loaded, fall back to displayId
+  }
+
+  // ── Helper: resolve robot at a cell (frame robots + spawn fallback) ────────
+  Robot? _robotAt(int row, int col) {
+    // Manual (D-pad) positions take precedence in both simulation modes so that
+    // inbound operations triggered from the context menu always find the robot
+    // at the position the user navigated it to.
+    final manualPositions = ref.read(manualRobotPositionsProvider);
+    if (manualPositions.isNotEmpty) {
+      final entry = manualPositions.entries
+          .where((e) => e.value.row == row && e.value.col == col)
+          .firstOrNull;
+      if (entry != null) {
+        return Robot(
+          id: entry.key,
+          name: entry.key,
+          type: entry.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+          x: entry.value.col.toDouble(),
+          y: entry.value.row.toDouble(),
+          state: 'IDLE',
+          battery: 1.0,
+        );
+      }
+    }
+    final frame = ref.read(simFrameProvider);
+    final config = ref.read(warehouseConfigProvider);
+    final allRobots = frame.robots.isNotEmpty
+        ? frame.robots
+        : (config?.robotSpawns
+                .map((s) => Robot(
+                      id: s.name ?? s.robotType,
+                      name: s.name ?? s.robotType,
+                      type: s.robotType,
+                      x: s.col.toDouble(),
+                      y: s.row.toDouble(),
+                      state: 'IDLE',
+                      battery: 1.0,
+                    ))
+                .toList() ??
+            []);
+    return allRobots
+        .where((r) => r.x.round() == col && r.y.round() == row)
+        .firstOrNull;
+  }
+
+  // ── Step 1: Move the first ENROUTE truck to the inbound bay ─────────────────
+  void _handleMoveTruckToBay(BuildContext ctx) async {
+    final trucks = ref.read(inboundTrucksProvider).valueOrNull?.trucks ?? [];
+    final enroute = trucks
+        .where((t) => (t['status_actual'] as String? ?? '') == 'ENROUTE')
+        .toList();
+    if (enroute.isEmpty) {
+      _showSnack(ctx, 'No ENROUTE trucks to move');
+      return;
+    }
+    final truck = enroute.first;
+    final truckId = truck['truck_id'] as String? ?? '';
+    try {
+      await ApiClient.instance.dispatchTruck(truckId);
+      if (ctx.mounted) {
+        _showSnack(ctx, 'Truck $truckId → Inbound Bay (WAITING)');
+      }
+    } catch (e) {
+      if (ctx.mounted) {
+        _showSnack(ctx, 'Move failed: $e');
+      }
+    }
+  }
+
+  // ── Inbound robot: unload one pallet from the nearest inbound truck ────────
+  // Follows the robotic PICK protocol: POST /api/v1/transactions/pick
+  // Source: TRUCK  →  robot.holding (persisted in backend ledger)
+  void _handleUnloadTruck(BuildContext ctx, int row, int col) async {
+    final robot = _robotAt(row, col);
+    if (robot == null) {
+      _showSnack(ctx, 'No robot at this cell');
+      return;
+    }
+
+    // Resolve DB robot_id (manualPositions uses display name, e.g. 'IR-01',
+    // while the ledger and fleet tab use the DB id, e.g. 'rb_01').
+    final dbRobotId = _resolveDbRobotId(robot.id);
+
+    // Don't allow double-loading
+    if (ref.read(robotCargoProvider).containsKey(dbRobotId)) {
+      _showSnack(ctx, '${robot.id} is already carrying a pallet');
+      return;
+    }
+
+    // Find the truck that is actually parked at the dock adjacent to this robot.
+    final config = ref.read(warehouseConfigProvider);
+    final trucksData = ref.read(inboundTrucksProvider).valueOrNull;
+    final trucks = trucksData?.trucks ?? const [];
+    final adjacentTruckId =
+        config != null ? _adjacentTruckId(row, col, config, trucks) : null;
+
+    if (adjacentTruckId == null) {
+      _showSnack(ctx, 'No docked truck adjacent to this robot');
+      return;
+    }
+
+    // Find first shipment with remaining qty on THAT truck specifically.
+    final shipments = trucksData?.shipmentsByTruck[adjacentTruckId] ?? const [];
+    Map<String, dynamic>? shipment;
+    for (final s in shipments) {
+      if ((s['qty_remaining'] as num? ?? 0) > 0) {
+        shipment = s;
+        break;
+      }
+    }
+
+    if (shipment == null) {
+      _showSnack(ctx, 'Truck $adjacentTruckId is empty — nothing to unload');
+      return;
+    }
+
+    final skuId = shipment['sku_id'] as String? ?? 'SKU-UNKNOWN';
+    final truckId = adjacentTruckId;
+
+    // ── Robotic PICK protocol ──────────────────────────────────────────────
+    // POST /api/v1/transactions/pick
+    // Records immutable ledger row, decrements truck shipment qty_remaining,
+    // credits RobotHolding — exactly what a real AMR firmware would call.
+    try {
+      await ApiClient.instance.pickTransaction(
+        robotId: dbRobotId, // DB id, not display name
+        functionalType: 'inbound_pick',
+        sourceType: 'TRUCK',
+        sourceId: truckId,
+        skuId: skuId,
+        qty: 40, // 1 pallet = 40 cases
+      );
+    } catch (e) {
+      if (ctx.mounted) {
+        _showSnack(ctx, 'PICK failed: $e');
+      }
+      return;
+    }
+
+    // Update local UI state only after backend confirms.
+    // loadPallet is the optimistic update; hydrateFromBackend below reconciles
+    // the state with the DB so it survives any future navigation/refresh.
+    ref.read(robotCargoProvider.notifier).loadPallet(
+          dbRobotId, // keyed by DB id so fleet tab lookup matches
+          PalletData(skuId: skuId, truckId: truckId),
+        );
+    // Re-hydrate all holdings from DB so no cargo is ever lost.
+    ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+    // Force the truck panel to show the updated qty_remaining immediately.
+    ref.invalidate(inboundTrucksProvider);
+    if (ctx.mounted) {
+      _showSnack(ctx,
+          '${robot.id} picked 1× $skuId from truck $truckId → navigate to Pallet Staging');
+    }
+    ref.read(manualModeProvider.notifier).addCustomEvent(
+          'Pallet Picked [TRUCK→ROBOT]',
+          '$dbRobotId PICK 1× $skuId from TRUCK:$truckId — ledger updated',
+        );
+  }
+
+  // ── Inbound robot: drop held pallet at current pallet-staging cell ─────────
+  // Follows the robotic DROP protocol: POST /api/v1/transactions/drop
+  // Dest: STAGING_SLOT  (slot selected via GET /api/v1/staging/slots/available)
+  void _handleDropPallet(BuildContext ctx, int row, int col) async {
+    final robot = _robotAt(row, col);
+    if (robot == null) {
+      _showSnack(ctx, 'No robot at this cell');
+      return;
+    }
+
+    final dbRobotId = _resolveDbRobotId(robot.id);
+    final pallet = ref.read(robotCargoProvider)[dbRobotId];
+    if (pallet == null) {
+      _showSnack(ctx, '${robot.id} has no pallet loaded');
+      return;
+    }
+
+    // Resolve the actual staging cell (robot may be adjacent, not on it).
+    final config = ref.read(warehouseConfigProvider);
+    final stagingCell =
+        config != null ? _adjacentStagingCell(row, col, config) : null;
+    final sRow = stagingCell?.row ?? row;
+    final sCol = stagingCell?.col ?? col;
+
+    // Local SKU-mix guard (fast UI check before calling backend)
+    final stagingNotifier = ref.read(stagingPalletsProvider.notifier);
+    final localError = stagingNotifier.canDrop(sRow, sCol, pallet.skuId);
+    if (localError != null) {
+      _showSnack(ctx, localError);
+      ref.read(manualModeProvider.notifier).addCustomEvent(
+            'SKU Mix Rejected',
+            'Staging [$col,$row] refused ${pallet.skuId} — $localError',
+          );
+      return;
+    }
+
+    // ── Robotic DROP protocol ──────────────────────────────────────────────
+    // 1) Ask the WMS for the best available staging slot for this SKU.
+    //    GET /api/v1/staging/slots/available?sku_id=…
+    String slotId;
+    try {
+      final slotData =
+          await ApiClient.instance.getAvailableStagingSlot(pallet.skuId);
+      slotId = slotData['slot_id'] as String? ?? '';
+      if (slotId.isEmpty) throw Exception('No slot_id in response');
+    } catch (e) {
+      if (ctx.mounted) {
+        _showSnack(ctx, 'Staging slot lookup failed: $e');
+      }
+      return;
+    }
+
+    // 2) POST /api/v1/transactions/drop
+    //    Deducts from RobotHolding, credits SkuStagingSlot, writes ledger row.
+    try {
+      await ApiClient.instance.dropTransaction(
+        robotId: dbRobotId, // DB id, not display name
+        destType: 'STAGING_SLOT',
+        destId: slotId,
+        qty: 40, // 1 pallet = 40 cases
+      );
+    } catch (e) {
+      if (ctx.mounted) {
+        _showSnack(ctx, 'DROP failed: $e');
+      }
+      return;
+    }
+
+    // Update local UI state only after backend confirms
+    stagingNotifier.drop(sRow, sCol, pallet.skuId);
+    ref.read(robotCargoProvider.notifier).clearCargo(dbRobotId);
+    final slotInfo = stagingNotifier.slotAt(sRow, sCol);
+    final count = slotInfo?.count ?? 1;
+    if (ctx.mounted) {
+      _showSnack(ctx,
+          '${robot.id} staged ${pallet.skuId} → slot $slotId ($count/$kMaxStagingPallets)');
+    }
+    ref.read(manualModeProvider.notifier).addCustomEvent(
+          'Pallet Staged [ROBOT→STAGING]',
+          '$dbRobotId DROP 1× ${pallet.skuId} → STAGING_SLOT:$slotId — ledger updated',
+        );
   }
 
   void _showInspectSheet(BuildContext ctx, String action, int row, int col) {
@@ -2380,9 +3001,30 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
     final selectedRobotId = ref.watch(selectedRobotIdProvider);
     final manualCtrl = ref.watch(manualRobotControllerProvider);
 
-    // In manual mode use locally-tracked positions; otherwise WS frame / spawns.
+    // Inbound trucks — watch the shared provider (polls every 5 s)
+    final truckDataAsync = ref.watch(inboundTrucksProvider);
+    final inboundTrucks = truckDataAsync.valueOrNull?.trucks ?? const [];
+    final shipmentsByTruck =
+        truckDataAsync.valueOrNull?.shipmentsByTruck ?? const {};
+    final truckApproach = <String, double>{
+      for (final t in inboundTrucks)
+        (t['truck_id'] as String? ?? ''):
+            ((t['status_actual'] as String? ?? '') == 'ENROUTE') ? 0.0 : 1.0,
+    };
+
+    // Auto-select a truck when navigated here from the Orders screen.
+    ref.listen<String?>(pendingTruckSelectionProvider, (_, truckId) {
+      if (truckId == null) return;
+      ref.read(pendingTruckSelectionProvider.notifier).state = null;
+      if (mounted) setState(() => _selectedTruckId = truckId);
+    });
+
+    // D-pad-moved robots take precedence in both simulation modes so that manual
+    // inbound operations (unload truck, drop at staging) remain accessible even
+    // while the auto-sim is running.
     final List<Robot> displayRobots;
     if (opsStarted && simMode == 'manual' && manualPositions.isNotEmpty) {
+      // Manual step mode: all robots driven exclusively by D-pad positions.
       displayRobots = manualPositions.entries
           .map((e) => Robot(
                 id: e.key,
@@ -2395,7 +3037,10 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
               ))
           .toList();
     } else {
-      displayRobots = frame.robots.isNotEmpty
+      // Automated mode (or manual before any D-pad moves): start from WS frame
+      // / spawns, then overlay any robots the user has manually moved via D-pad
+      // so inbound manual ops (unload / drop) remain available in auto mode.
+      final base = frame.robots.isNotEmpty
           ? frame.robots
           : (config?.robotSpawns
                   .map((s) => Robot(
@@ -2409,6 +3054,26 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                       ))
                   .toList() ??
               []);
+      if (manualPositions.isNotEmpty) {
+        final manualIds = manualPositions.keys.toSet();
+        final overrides = manualPositions.entries
+            .map((e) => Robot(
+                  id: e.key,
+                  name: e.key,
+                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  x: e.value.col.toDouble(),
+                  y: e.value.row.toDouble(),
+                  state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',
+                  battery: 1.0,
+                ))
+            .toList();
+        displayRobots = [
+          ...base.where((r) => !manualIds.contains(r.id)),
+          ...overrides,
+        ];
+      } else {
+        displayRobots = base;
+      }
     }
 
     // Request keyboard focus so arrow keys work immediately.
@@ -2494,11 +3159,21 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                           });
                         },
                         onSecondaryTapUp: (d) {
-                          final box = context.findRenderObject() as RenderBox;
-                          final localPos = box.globalToLocal(d.globalPosition);
-                          _showContextMenu(context, d.globalPosition, localPos);
+                          _showContextMenu(context, d.globalPosition,
+                              d.localPosition, displayRobots);
                         },
                         onTapUp: (d) {
+                          // Check truck hit first.
+                          final truckHit = _truckAtLocal(d.localPosition,
+                              config, inboundTrucks, truckApproach);
+                          if (truckHit != null) {
+                            setState(() {
+                              _selectedTruckId = _selectedTruckId == truckHit
+                                  ? null
+                                  : truckHit;
+                            });
+                            return;
+                          }
                           // Tap a robot to select it for D-pad control.
                           final hit =
                               _robotAtLocal(d.localPosition, displayRobots);
@@ -2510,6 +3185,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                             ref.read(selectedRobotIdProvider.notifier).state =
                                 null;
                           }
+                          setState(() => _selectedTruckId = null);
                         },
                         child: ClipRect(
                           child: AnimatedBuilder(
@@ -2531,6 +3207,13 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                                 selectedRobotId: selectedRobotId,
                                 blockedCells:
                                     opsStarted ? blockedCells : const {},
+                                inboundTrucks: inboundTrucks,
+                                shipmentsByTruck: shipmentsByTruck,
+                                truckApproach: truckApproach,
+                                selectedTruckId: _selectedTruckId,
+                                robotCargo: ref.watch(robotCargoProvider),
+                                stagingPallets:
+                                    ref.watch(stagingPalletsProvider),
                               ),
                               child: const SizedBox.expand(),
                             ),
@@ -2544,7 +3227,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                       _buildStartOpsOverlay(config),
 
                     // ── D-pad: manual robot control ───────────────────────────
-                    if (opsStarted && simMode == 'manual' && manualCtrl != null)
+                    if (opsStarted && manualCtrl != null)
                       Positioned(
                         bottom: 24,
                         left: 0,
@@ -2560,7 +3243,8 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                     // ── Scout progress badge ─────────────────────────────────
                     if (opsStarted &&
                         exploredCells.isNotEmpty &&
-                        config != null)
+                        config != null &&
+                        exploredCells.length < config.rows * config.cols)
                       Positioned(
                         top: 12,
                         left: 12,
@@ -2575,6 +3259,11 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                       _buildHoverTooltip(config, displayRobots),
                     ..._buildSpeechBubbles(
                         ref.watch(speechBubbleProvider), config),
+
+                    // ── Truck info panel ──────────────────────────────────────
+                    if (_selectedTruckId != null)
+                      _buildTruckPanel(
+                          _selectedTruckId!, inboundTrucks, shipmentsByTruck),
                   ],
                 ), // Stack
               ); // MouseRegion
@@ -2584,6 +3273,211 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
       ), // Column
     ); // Focus
   }
+
+  // ── Truck hit-test ────────────────────────────────────────────────────────
+
+  String? _truckAtLocal(
+    Offset local,
+    WarehouseConfig? config,
+    List<Map<String, dynamic>> trucks,
+    Map<String, double> approach,
+  ) {
+    if (config == null || trucks.isEmpty || _canvasSize == Size.zero) {
+      return null;
+    }
+    final rows = config.rows;
+    final cols = config.cols;
+    final cw = (_canvasSize.width / cols) * _scale;
+    final ch = (_canvasSize.height / rows) * _scale;
+
+    final inboundMarkers =
+        config.cells.where((c) => c.type == CellType.inbound).toList();
+    final allDocks =
+        config.cells.where((c) => c.type == CellType.dock).toList();
+    final double refCol = inboundMarkers.isNotEmpty
+        ? inboundMarkers.fold<double>(0.0, (s, d) => s + d.col) /
+            inboundMarkers.length
+        : (allDocks.isEmpty
+            ? 0.0
+            : allDocks.fold<double>(0.0, (s, d) => s + d.col) /
+                allDocks.length);
+    final fromLeft = (allDocks.isEmpty && inboundMarkers.isEmpty)
+        ? true
+        : refCol <= (cols / 2);
+    final dockCells = (allDocks.isNotEmpty ? allDocks : inboundMarkers)
+        .where((c) => fromLeft ? c.col <= (cols / 2) : c.col > (cols / 2))
+        .toList()
+      ..sort(
+          (a, b) => fromLeft ? a.row.compareTo(b.row) : a.col.compareTo(b.col));
+
+    int slot = 0;
+    for (final truck in trucks) {
+      final tid = truck['truck_id'] as String? ?? '';
+      final progress = approach[tid] ?? 1.0;
+      final dock =
+          dockCells.isNotEmpty ? dockCells[slot % dockCells.length] : null;
+      slot++;
+
+      final Offset truckCenter;
+      if (progress < 1.0) {
+        final enrouteRow = slot - 1;
+        truckCenter = fromLeft
+            ? Offset(
+                _offset.dx + 0.5 * cw, _offset.dy + (enrouteRow + 0.5) * ch)
+            : Offset(
+                _offset.dx + (enrouteRow + 0.5) * cw, _offset.dy + 0.5 * ch);
+      } else if (dock != null) {
+        truckCenter = Offset(
+          _offset.dx + (dock.col + 0.5) * cw,
+          _offset.dy + (dock.row + 0.5) * ch,
+        );
+      } else {
+        truckCenter = Offset(_offset.dx + 0.5 * cw, _offset.dy + 0.5 * ch);
+      }
+
+      // Match draw size (0.9× cell width/height)
+      final tw = cw * 0.9;
+      final th = ch * 0.9;
+      final hitRect =
+          Rect.fromCenter(center: truckCenter, width: tw + 8, height: th + 8);
+      if (hitRect.contains(local)) return tid;
+    }
+    return null;
+  }
+
+  // ── Truck info panel ──────────────────────────────────────────────────────
+
+  Widget _buildTruckPanel(
+    String truckId,
+    List<Map<String, dynamic>> trucks,
+    Map<String, List<Map<String, dynamic>>> shipmentsByTruck,
+  ) {
+    final truck = trucks.firstWhere(
+      (t) => t['truck_id'] == truckId,
+      orElse: () => const {},
+    );
+    final lines = shipmentsByTruck[truckId] ?? [];
+    final status = truck['status_actual'] as String? ?? '?';
+    final truckType = truck['truck_type'] as String? ?? '?';
+    final carrier = truck['carrier_name'] as String? ?? '';
+
+    final statusColor = switch (status) {
+      'ENROUTE' => const Color(0xFFFFCC00),
+      'ARRIVED' || 'YARD_ASSIGNED' => const Color(0xFF00D4FF),
+      'WAITING' || 'UNLOADING' => const Color(0xFF00FF88),
+      _ => const Color(0xFF8B949E),
+    };
+
+    const mono = TextStyle(
+        fontSize: 10, color: Color(0xFF8B949E), fontFamily: 'ShareTechMono');
+
+    return Positioned(
+      top: 60,
+      right: 16,
+      child: GestureDetector(
+        onTap: () => setState(() => _selectedTruckId = null),
+        child: Container(
+          width: 230,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1117).withAlpha(245),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF30363D)),
+          ),
+          child: DefaultTextStyle(
+            style: mono,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(children: [
+                  Expanded(
+                    child: Text(
+                      truckId,
+                      style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFFE6EDF3),
+                          fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const Text('✕', style: TextStyle(color: Color(0xFF8B949E))),
+                ]),
+                const SizedBox(height: 6),
+                _tpRow('Status', status),
+                _tpRow('Type', truckType),
+                if (carrier.isNotEmpty) _tpRow('Carrier', carrier),
+                const SizedBox(height: 4),
+                Row(children: [
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: statusColor.withAlpha(30),
+                      borderRadius: BorderRadius.circular(3),
+                      border: Border.all(color: statusColor.withAlpha(80)),
+                    ),
+                    child: Text(status,
+                        style: TextStyle(
+                            color: statusColor,
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ]),
+                // ── Move to inbound bay (ENROUTE only) ───────────────────
+                if (status == 'ENROUTE') ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TruckMoveButton(
+                      truckId: truckId,
+                      onMoved: () => setState(() => _selectedTruckId = null),
+                    ),
+                  ),
+                ],
+                if (lines.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  const Text('CARGO',
+                      style: TextStyle(
+                          color: Color(0xFFE6EDF3), letterSpacing: 1)),
+                  const SizedBox(height: 4),
+                  ...lines.map((l) {
+                    final sku = l['sku_id'] as String? ?? '?';
+                    final pallets =
+                        (l['qty_pallets_expected'] as num? ?? 0).toInt();
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Row(children: [
+                        const Text('📦 ', style: TextStyle(fontSize: 9)),
+                        Expanded(
+                            child: Text(sku, overflow: TextOverflow.ellipsis)),
+                        Text('$pallets plt',
+                            style: const TextStyle(
+                                color: Color(0xFF00D4FF),
+                                fontWeight: FontWeight.bold)),
+                      ]),
+                    );
+                  }),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _tpRow(String label, String value) => Padding(
+        padding: const EdgeInsets.only(bottom: 2),
+        child: Row(children: [
+          SizedBox(
+              width: 52,
+              child: Text(label,
+                  style: const TextStyle(color: Color(0xFF8B949E)))),
+          Expanded(
+              child: Text(value,
+                  style: const TextStyle(color: Color(0xFFE6EDF3)))),
+        ]),
+      );
 
   // ── Start-ops overlay shown before the user starts operations ─────────────
   Widget _buildStartOpsOverlay(WarehouseConfig config) {
@@ -2914,10 +3808,11 @@ class _MobilePortraitLayout extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     Widget body = switch (selectedIndex) {
       1 => const FloorCanvas(),
-      2 => _RightChatPanel(user: user),
-      3 => const AboutScreen(),
-      4 => const CommunityScreen(),
-      5 => const GameScreen(),
+      2 => const OrdersScreen(),
+      3 => _RightChatPanel(user: user),
+      4 => const AboutScreen(),
+      5 => const CommunityScreen(),
+      6 => const GameScreen(),
       _ => Column(
           children: [
             _TickerStrip(frame: frame),

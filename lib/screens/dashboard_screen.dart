@@ -4,6 +4,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../application/providers.dart';
 import '../core/api_client.dart';
 import '../core/auth/auth_provider.dart';
 import '../core/sim_ws.dart';
@@ -20,7 +21,11 @@ class DashboardScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final auth = ref.watch(authProvider);
     final frame = ref.watch(simFrameProvider);
-
+    final trucksData = ref.watch(inboundTrucksProvider);
+    final inboundTrucks = trucksData.valueOrNull?.trucks ?? const [];
+    final shipmentsByTruck =
+        trucksData.valueOrNull?.shipmentsByTruck ?? const {};
+    final cargoMap = ref.watch(robotCargoProvider);
 
     final user = auth is AuthLoggedIn ? auth.user : null;
 
@@ -90,11 +95,32 @@ class DashboardScreen extends ConsumerWidget {
                     // â”€â”€ Layout proposals (D5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     if (user != null && user.canAdmin)
                       _PendingProposals(frame.layoutProposals),
-                    // â”€â”€ Scouting progress + WMS inventory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    // ── Scouting progress + WMS inventory ────────────────────────────────
                     const WmsDashboardPanel(),
-                    // â”€â”€ Robots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    // ── Robots ───────────────────────────────────────────────────────────
                     _SectionHeader('Fleet (${frame.robots.length} robots)'),
-                    ...frame.robots.map((r) => RobotCard(robot: r)),
+                    ...frame.robots
+                        .map((r) => RobotCard(robot: r, cargo: cargoMap[r.id])),
+
+                    // ── Inbound Trucks ───────────────────────────────────────────────────
+                    const SizedBox(height: 16),
+                    _SectionHeader('Inbound Trucks (${inboundTrucks.length})'),
+                    if (inboundTrucks.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text(
+                          'No inbound trucks on road.',
+                          style:
+                              TextStyle(fontSize: 11, color: Color(0xFF8B949E)),
+                        ),
+                      )
+                    else
+                      ...inboundTrucks.map((t) => TruckFleetCard(
+                            truck: t,
+                            shipments: shipmentsByTruck[
+                                    t['truck_id'] as String? ?? ''] ??
+                                const [],
+                          )),
                     const SizedBox(height: 80), // nav bar padding
                   ],
                 ),
@@ -373,7 +399,247 @@ class _WaveBadge extends StatelessWidget {
       );
 }
 
-// â”€â”€ Bottom navigation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Inbound Truck Fleet Card ──────────────────────────────────────────────────
+
+class TruckFleetCard extends StatelessWidget {
+  const TruckFleetCard(
+      {super.key, required this.truck, required this.shipments});
+  final Map<String, dynamic> truck;
+  final List<Map<String, dynamic>> shipments;
+
+  @override
+  Widget build(BuildContext context) {
+    final truckId = truck['truck_id'] as String? ?? '?';
+    final type = truck['truck_type'] as String? ?? '?';
+    final carrier = truck['carrier_name'] as String? ?? '';
+    final status = truck['status_actual'] as String? ?? '?';
+
+    const yellow = Color(0xFFFFCC00);
+    const cyan = Color(0xFF00D4FF);
+    const green = Color(0xFF00FF88);
+    const mono = TextStyle(fontSize: 10, color: Color(0xFF8B949E));
+
+    final statusColor = switch (status) {
+      'ENROUTE' => yellow,
+      'ARRIVED' || 'YARD_ASSIGNED' => cyan,
+      'WAITING' || 'UNLOADING' => green,
+      _ => const Color(0xFF8B949E),
+    };
+
+    final totalExpPal = shipments.fold<int>(
+        0, (s, e) => s + ((e['qty_pallets_expected'] as num? ?? 0).toInt()));
+    final totalRemPal = shipments.fold<int>(
+        0, (s, e) => s + ((e['qty_pallets_remaining'] as num? ?? 0).toInt()));
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: statusColor.withAlpha(60)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: statusColor.withAlpha(25),
+                borderRadius: BorderRadius.circular(3),
+                border: Border.all(color: statusColor.withAlpha(80)),
+              ),
+              child: Text('TR-$type',
+                  style: TextStyle(
+                      fontSize: 9,
+                      color: statusColor,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1)),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(truckId,
+                  style: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xFFE6EDF3),
+                      fontWeight: FontWeight.bold)),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: statusColor.withAlpha(20),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(status,
+                  style: TextStyle(
+                      fontSize: 9,
+                      color: statusColor,
+                      fontWeight: FontWeight.bold)),
+            ),
+          ]),
+          if (carrier.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text('Carrier: $carrier', style: mono),
+          ],
+          if (shipments.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Divider(color: Color(0xFF30363D), height: 1),
+            const SizedBox(height: 6),
+            const Text('CARGO',
+                style: TextStyle(
+                    fontSize: 9,
+                    color: Color(0xFF8B949E),
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2)),
+            const SizedBox(height: 5),
+            // Group by sku_id → one card per SKU
+            ...() {
+              final grouped = <String,
+                  ({int expected, int remaining, String po, int count})>{};
+              for (final s in shipments) {
+                final sku = s['sku_id'] as String? ?? '?';
+                final exp = (s['qty_pallets_expected'] as num? ?? 0).toInt();
+                final rem = (s['qty_pallets_remaining'] as num? ?? 0).toInt();
+                final po = s['po_id'] as String? ?? '';
+                final cur = grouped[sku];
+                grouped[sku] = (
+                  expected: (cur?.expected ?? 0) + exp,
+                  remaining: (cur?.remaining ?? 0) + rem,
+                  po: cur == null ? po : cur.po,
+                  count: (cur?.count ?? 0) + 1,
+                );
+              }
+              return grouped.entries.map((e) {
+                final picked = e.value.expected - e.value.remaining;
+                final fillFraction = e.value.expected > 0
+                    ? e.value.remaining / e.value.expected
+                    : 1.0;
+                final countColor = picked > 0
+                    ? const Color(0xFFFFCC00) // yellow — partially unloaded
+                    : const Color(0xFF00D4FF); // cyan — untouched
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 5),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D1117),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF30363D)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Padding(
+                            padding: EdgeInsets.only(top: 1, right: 6),
+                            child: Text('📦', style: TextStyle(fontSize: 12)),
+                          ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(e.key,
+                                    style: const TextStyle(
+                                        fontSize: 11,
+                                        color: Color(0xFFE6EDF3),
+                                        fontWeight: FontWeight.bold),
+                                    overflow: TextOverflow.ellipsis),
+                                if (e.value.po.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 2),
+                                    child: Text('PO: ${e.value.po}',
+                                        style: const TextStyle(
+                                            fontSize: 9,
+                                            color: Color(0xFF8B949E)),
+                                        overflow: TextOverflow.ellipsis),
+                                  ),
+                                if (e.value.count > 1)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 1),
+                                    child: Text('${e.value.count} shipments',
+                                        style: const TextStyle(
+                                            fontSize: 9,
+                                            color: Color(0xFF8B949E))),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          // ── remaining / total ────────────────────────────
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              RichText(
+                                text: TextSpan(
+                                  style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold),
+                                  children: [
+                                    TextSpan(
+                                      text: '${e.value.remaining}',
+                                      style: TextStyle(color: countColor),
+                                    ),
+                                    TextSpan(
+                                      text: ' / ${e.value.expected}',
+                                      style: const TextStyle(
+                                          color: Color(0xFF484F58)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(height: 1),
+                              const Text('pallets',
+                                  style: TextStyle(
+                                      fontSize: 8, color: Color(0xFF8B949E))),
+                              if (picked > 0) ...[
+                                const SizedBox(height: 2),
+                                Text('−$picked picked',
+                                    style: const TextStyle(
+                                        fontSize: 9, color: Color(0xFFFF8800))),
+                              ],
+                            ],
+                          ),
+                        ],
+                      ),
+                      // ── depletion bar ────────────────────────────────────
+                      const SizedBox(height: 6),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: LinearProgressIndicator(
+                          value: fillFraction,
+                          minHeight: 3,
+                          backgroundColor: const Color(0xFF21262D),
+                          valueColor: AlwaysStoppedAnimation<Color>(countColor),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList();
+            }(),
+            const SizedBox(height: 2),
+            Row(children: [
+              const Spacer(),
+              if (totalRemPal != totalExpPal)
+                Text('$totalRemPal / $totalExpPal pallets remaining',
+                    style: const TextStyle(
+                        fontSize: 10,
+                        color: Color(0xFFFFCC00),
+                        fontWeight: FontWeight.bold))
+              else
+                Text('Total  $totalExpPal pallets', style: mono),
+            ]),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ── Bottom navigation ─────────────────────────────────────────────────────────
 
 class _BottomNav extends ConsumerWidget {
   const _BottomNav({this.user});

@@ -7,7 +7,6 @@
 ///   4. OAuth: open browser with url_launcher, gateway redirects to
 ///      wois://auth-callback?wois_token=...&wois_user=...
 ///      uni_links_plus intercepts the deep link and calls [handleOAuthCallback].
-///   5. Dev mode: POST /auth/dev-login → token.
 library;
 
 import 'dart:async';
@@ -67,7 +66,9 @@ class AuthNotifier extends StateNotifier<AuthState> {
     // main.dart) set the correct state. Guards against _restore() overriding it.
     if (kIsWeb &&
         (Uri.base.queryParameters.containsKey('wois_token') ||
-            Uri.base.queryParameters.containsKey('auth_error'))) return;
+            Uri.base.queryParameters.containsKey('auth_error'))) {
+      return;
+    }
 
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString(_kTokenKey);
@@ -134,32 +135,6 @@ class AuthNotifier extends StateNotifier<AuthState> {
       _applySession(session);
     } catch (e) {
       state = AuthError('Could not parse OAuth callback: $e');
-    }
-  }
-
-  // ── Dev login ─────────────────────────────────────────────────────────────
-
-  Future<void> devLogin() async {
-    state = AuthLoading();
-    try {
-      final data = await _api.devLogin();
-      final token = data['token'] as String;
-      final userMap = data['user'] as Map<String, dynamic>;
-      final expStr = data['expires_at'] as String?;
-      final user = WoisUser.fromJson(userMap);
-      final session = WoisSession(
-        token: token,
-        user: user,
-        expiresAt: expStr != null
-            ? DateTime.parse(expStr)
-            : DateTime.now().add(const Duration(days: 1)),
-      );
-      await _persist(session);
-      _applySession(session);
-    } on ApiException catch (e) {
-      state = AuthError('Dev login failed (${e.statusCode}): ${e.message}');
-    } catch (e) {
-      state = AuthError('Gateway unreachable — is WIOS running?\n$e');
     }
   }
 

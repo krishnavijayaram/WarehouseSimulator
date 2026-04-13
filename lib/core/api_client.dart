@@ -27,7 +27,7 @@ class ApiClient {
 
   Map<String, String> get _headers => {
         'Content-Type': 'application/json',
-        'X-API-Key': 'wois-gateway-internal-key-2026',
+        'X-API-Key': gatewayApiKey,
         if (_token != null) 'Authorization': 'Bearer $_token',
       };
 
@@ -35,12 +35,6 @@ class ApiClient {
       Uri.parse('$gatewayBaseUrl$path').replace(queryParameters: query);
 
   // ── Auth ─────────────────────────────────────────────────────────────────
-
-  /// POST /auth/dev-login — development bypass (localhost only).
-  Future<Map<String, dynamic>> devLogin() async {
-    final r = await http.post(_uri('/auth/dev-login'), headers: _headers);
-    return _check(r);
-  }
 
   /// GET /api/v1/users/sessions/{token} — validate stored token.
   /// Always passes the token as Bearer auth (called before setToken on startup).
@@ -506,6 +500,212 @@ class ApiClient {
     );
     final d = _check(r);
     return (d['cells'] as List? ?? []).cast<Map<String, dynamic>>();
+  }
+
+  // ── Orders (Inbound / Outbound) ───────────────────────────────────────────
+
+  /// POST /api/v1/yms/inbound-orders — place an inbound PO.
+  ///
+  /// [lines] is a list of `{sku_id: String, qty_pallets: int}`.
+  /// Returns `{truck_id, po_id, eta, shipment_ids, message}`.
+  Future<Map<String, dynamic>> createInboundOrder({
+    required String warehouseId,
+    required List<Map<String, dynamic>> lines,
+    String truckType = 'M',
+    String carrierName = 'AUTO',
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/yms/inbound-orders'),
+      headers: _headers,
+      body: jsonEncode({
+        'warehouse_id': warehouseId,
+        'lines': lines,
+        'truck_type': truckType,
+        'carrier_name': carrierName,
+      }),
+    );
+    return _check(r);
+  }
+
+  /// POST /api/v1/yms/trucks/{truck_id}/force-arrive
+  ///
+  /// Instantly advances an ENROUTE truck through ARRIVED → YARD_ASSIGNED →
+  /// WAITING. Used when the 60-second background task was lost.
+  /// Returns `{status, truck_id, slot_id, message}`.
+  Future<Map<String, dynamic>> dispatchTruck(String truckId) async {
+    final r = await http.post(
+      _uri('/api/v1/yms/trucks/$truckId/force-arrive'),
+      headers: _headers,
+    );
+    return _check(r);
+  }
+
+  /// POST /api/v1/oms/outbound/{order_id}/dispatch
+  ///
+  /// Manually dispatches a PACKED outbound order.
+  /// Returns `{status, order_id, message}`.
+  Future<Map<String, dynamic>> dispatchOutbound(String orderId) async {
+    final r = await http.post(
+      _uri('/api/v1/oms/outbound/$orderId/dispatch'),
+      headers: _headers,
+    );
+    return _check(r);
+  }
+
+  /// POST /api/v1/oms/outbound — create an outbound dispatch order.
+  ///
+  /// [lines] is a list of `{sku_id, unit_type, qty}` where
+  /// unit_type is 'PALLET' | 'CASE' | 'LOOSE'.
+  /// Returns `{status, order_id, message}`.
+  Future<Map<String, dynamic>> createOutboundOrder({
+    required String warehouseId,
+    required List<Map<String, dynamic>> lines,
+    String customerId = 'WALK-IN',
+    String destination = 'TBD',
+    int priorityActual = 3,
+    int actualSlaHours = 48,
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/oms/outbound'),
+      headers: _headers,
+      body: jsonEncode({
+        'warehouse_id': warehouseId,
+        'lines': lines,
+        'customer_id': customerId,
+        'destination_actual': destination,
+        'priority_actual': priorityActual,
+        'actual_sla_hours': actualSlaHours,
+      }),
+    );
+    return _check(r);
+  }
+
+  /// GET /api/v1/yms/trucks?warehouse_id=…&truck_direction=INBOUND
+  /// Returns inbound trucks sorted by status.
+  Future<List<Map<String, dynamic>>> getInboundTrucks(
+      String warehouseId) async {
+    final r = await http.get(
+      _uri('/api/v1/yms/trucks', {
+        'warehouse_id': warehouseId,
+      }),
+      headers: _headers,
+    );
+    return _checkList(r)
+        .cast<Map<String, dynamic>>()
+        .where((t) =>
+            (t['truck_direction'] as String? ?? '') == 'INBOUND' &&
+            (t['status_actual'] as String? ?? '') != 'DEPARTED')
+        .toList();
+  }
+
+  /// GET /api/v1/yms/inbound-shipments?warehouse_id=…
+  Future<List<Map<String, dynamic>>> getInboundShipments(
+      String warehouseId) async {
+    final r = await http.get(
+      _uri('/api/v1/yms/inbound-shipments', {'warehouse_id': warehouseId}),
+      headers: _headers,
+    );
+    return _checkList(r).cast<Map<String, dynamic>>();
+  }
+
+  /// GET /api/v1/oms/orders?warehouse_id=…
+  /// Returns all outbound orders for the given warehouse.
+  Future<List<Map<String, dynamic>>> getOutboundOrders(
+      String warehouseId) async {
+    final r = await http.get(
+      _uri('/api/v1/oms/orders', {'warehouse_id': warehouseId}),
+      headers: _headers,
+    );
+    return _checkList(r).cast<Map<String, dynamic>>();
+  }
+
+  /// GET /api/v1/orders?warehouse_id=…&order_type=…
+  /// Returns canonical OrderHeader rows (each with embedded `lines` list).
+  Future<List<Map<String, dynamic>>> getOrders(
+      String warehouseId, String orderType) async {
+    final r = await http.get(
+      _uri('/api/v1/orders', {
+        'warehouse_id': warehouseId,
+        'order_type': orderType,
+      }),
+      headers: _headers,
+    );
+    return _checkList(r).cast<Map<String, dynamic>>();
+  }
+
+  // ── Robotic transaction protocol ──────────────────────────────────────────
+
+  /// GET /api/v1/staging/slots/available?sku_id=…
+  /// Returns the best available staging slot for the given SKU.
+  /// Response: {slot_id, assigned_sku_id, is_occupied, pallet_count, match}
+  Future<Map<String, dynamic>> getAvailableStagingSlot(String skuId) async {
+    final r = await http.get(
+      _uri('/api/v1/staging/slots/available', {'sku_id': skuId}),
+      headers: _headers,
+    );
+    return _check(r);
+  }
+
+  /// POST /api/v1/transactions/pick — inbound robot picks one pallet from a truck.
+  /// [robotId]       robot DB id (e.g. 'rb_01')
+  /// [functionalType] 'inbound_pick'
+  /// [sourceType]    'TRUCK'
+  /// [sourceId]      truck_id
+  /// [skuId]         SKU being picked
+  Future<Map<String, dynamic>> pickTransaction({
+    required String robotId,
+    required String functionalType,
+    required String sourceType,
+    required String sourceId,
+    required String skuId,
+    int qty = 1,
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/transactions/pick'),
+      headers: _headers,
+      body: jsonEncode({
+        'robot_id': robotId,
+        'functional_type': functionalType,
+        'source_type': sourceType,
+        'source_id': sourceId,
+        'sku_id': skuId,
+        'qty': qty,
+      }),
+    );
+    return _check(r);
+  }
+
+  /// POST /api/v1/transactions/drop — inbound robot drops pallet at staging slot.
+  /// [robotId]  robot DB id
+  /// [destType] 'STAGING_SLOT'
+  /// [destId]   slot_id string (e.g. 'SS-1774401')
+  Future<Map<String, dynamic>> dropTransaction({
+    required String robotId,
+    required String destType,
+    required String destId,
+    int qty = 1,
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/transactions/drop'),
+      headers: _headers,
+      body: jsonEncode({
+        'robot_id': robotId,
+        'dest_type': destType,
+        'dest_id': destId,
+        'qty': qty,
+      }),
+    );
+    return _check(r);
+  }
+
+  /// GET /api/v1/transactions/holdings — all robots currently holding cargo (qty_held > 0).
+  /// Used to restore [robotCargoProvider] after a page refresh or service restart.
+  Future<List<Map<String, dynamic>>> getActiveHoldings() async {
+    final r = await http.get(
+      _uri('/api/v1/transactions/holdings'),
+      headers: _headers,
+    );
+    return _checkList(r).cast<Map<String, dynamic>>();
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────

@@ -103,39 +103,26 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                       onTap: () =>
                           ref.read(authProvider.notifier).startOAuth('github'),
                     ),
+                  if (_providers['linkedin'] == true)
+                    _OAuthButton(
+                      label: 'Continue with LinkedIn',
+                      icon: const Icon(Icons.work_rounded,
+                          size: 20, color: Color(0xFF0A66C2)),
+                      onTap: () => ref
+                          .read(authProvider.notifier)
+                          .startOAuth('linkedin'),
+                    ),
                   if (_providers.values.every((v) => !v))
                     const Padding(
                       padding: EdgeInsets.only(bottom: 12),
                       child: Text(
-                        'No OAuth providers configured.\nUse Dev Mode below.',
+                        'No OAuth providers configured.',
                         textAlign: TextAlign.center,
                         style:
                             TextStyle(fontSize: 11, color: Color(0xFF8B949E)),
                       ),
                     ),
                 ],
-
-                const SizedBox(height: 16),
-                const Divider(color: Color(0xFF30363D)),
-                const SizedBox(height: 16),
-
-                // ── Dev mode bypass ────────────────────────────────────────────
-                auth is AuthLoading
-                    ? const CircularProgressIndicator(color: Color(0xFF00D4FF))
-                    : OutlinedButton.icon(
-                        icon: const Text('⚡', style: TextStyle(fontSize: 16)),
-                        label:
-                            const Text('Dev Mode — Skip Auth (localhost only)'),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFF00D4FF),
-                          side: const BorderSide(color: Color(0xFF30363D)),
-                          minimumSize: const Size(double.infinity, 48),
-                          textStyle: const TextStyle(
-                              fontFamily: 'ShareTechMono', fontSize: 12),
-                        ),
-                        onPressed: () =>
-                            ref.read(authProvider.notifier).devLogin(),
-                      ),
 
                 const SizedBox(height: 20),
                 const Text(

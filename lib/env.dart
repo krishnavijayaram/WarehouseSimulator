@@ -12,14 +12,17 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 const _env = String.fromEnvironment('ENV', defaultValue: 'dev');
 const _gatewayUrl = String.fromEnvironment('GATEWAY_URL', defaultValue: '');
 const _simWsUrl = String.fromEnvironment('SIM_WS_URL', defaultValue: '');
+const _gatewayApiKey =
+    String.fromEnvironment('GATEWAY_API_KEY', defaultValue: '');
 
 /// Base URL of the WIOS API gateway.
 ///   dev:  http://10.0.2.2:8004  (emulator) / http://localhost:8004 (web/desktop)
 ///   prod: set via --dart-define=GATEWAY_URL=https://...
 const _prodGatewayUrl =
-    'https://wios-gateway.kindcoast-88f268fb.koreacentral.azurecontainerapps.io';
+    'https://wios-gateway.victoriousisland-b9d5fbf6.centralindia.azurecontainerapps.io';
+// WebSocket proxied through the gateway — wios-sim is internal-only.
 const _prodSimWsUrl =
-    'wss://wios-sim.kindcoast-88f268fb.koreacentral.azurecontainerapps.io/ws/sim';
+    'wss://wios-gateway.victoriousisland-b9d5fbf6.centralindia.azurecontainerapps.io/ws/sim';
 
 String get gatewayBaseUrl {
   if (_gatewayUrl.isNotEmpty) return _gatewayUrl;
@@ -43,3 +46,11 @@ bool get isDev => _env == 'dev';
 bool get isProd => _env == 'prod';
 
 bool get _isWeb => kIsWeb;
+
+/// API key for the X-API-Key header sent to the gateway.
+///   dev:  hardcoded local dev key
+///   prod: set via --dart-define=GATEWAY_API_KEY=...
+String get gatewayApiKey {
+  if (_gatewayApiKey.isNotEmpty) return _gatewayApiKey;
+  return 'wois-gateway-internal-key-2026'; // local dev default
+}
