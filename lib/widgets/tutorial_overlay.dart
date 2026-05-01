@@ -18,53 +18,60 @@ class TutorialStep {
     required this.icon,
     this.alignment = Alignment.center,
   });
-  final String    title;
-  final String    body;
-  final IconData  icon;
+  final String title;
+  final String body;
+  final IconData icon;
   final Alignment alignment; // where the tooltip card floats
 }
 
 const _kSteps = [
   TutorialStep(
     icon: Icons.waving_hand,
-    title: 'Welcome to WOIS',
-    body: 'Warehouse Operations AI Simulator — a live, AI-driven warehouse floor.\n\nThis quick tour shows you around.',
+    title: 'Welcome to WIOS',
+    body:
+        'Warehouse Intelligence & Operations System — a live, AI-driven warehouse floor.\n\nThis quick tour shows you around.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.dashboard,
     title: 'Dashboard',
-    body: 'The dashboard shows live KPIs, fleet status, simulation controls and self-healing events.\n\nOn desktop it stays always visible on the left.',
+    body:
+        'The dashboard shows live KPIs, fleet status, simulation controls and self-healing events.\n\nOn desktop it stays always visible on the left.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.grid_view,
     title: 'Warehouse Floor',
-    body: 'A live top-down view of the warehouse grid.\n\nPinch or scroll to zoom. Coloured dots = robots moving in real-time at 20 Hz.',
+    body:
+        'A live top-down view of the warehouse grid.\n\nPinch or scroll to zoom. Coloured dots = robots moving in real-time at 20 Hz.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.chat_bubble_outline,
     title: 'AI Chat',
-    body: 'Ask the warehouse AI anything:\n"How many bots are idle?"\n"Show me recent conflicts"\n\nThe AI reads live sensor data before answering.',
+    body:
+        'Ask the warehouse AI anything:\n"How many bots are idle?"\n"Show me recent conflicts"\n\nThe AI reads live sensor data before answering.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.sports_esports,
     title: 'Game Mode',
-    body: 'Unlock sabotage, layout proposals, and simulation challenges as you level up.\n\nGame tab appears when you reach Level 4.',
+    body:
+        'Unlock sabotage, layout proposals, and simulation challenges as you level up.\n\nGame tab appears when you reach Level 4.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.devices,
     title: 'Responsive Layout',
-    body: '• Desktop / wide tablet: 3-column layout — nav · floor · panel\n• Phone landscape: full-screen floor view\n• Phone portrait: panel view (scrollable)\n\nRotate or resize anytime.',
+    body:
+        '• Desktop / wide tablet: 3-column layout — nav · floor · panel\n• Phone landscape: full-screen floor view\n• Phone portrait: panel view (scrollable)\n\nRotate or resize anytime.',
     alignment: Alignment.center,
   ),
   TutorialStep(
     icon: Icons.check_circle_outline,
     title: "You're all set!",
-    body: 'The simulation is already running. Watch the robots pick orders live!\n\nTap the ⬡ logo in the menu any time to replay this tour.',
+    body:
+        'The simulation is already running. Watch the robots pick orders live!\n\nTap the ⬡ logo in the menu any time to replay this tour.',
     alignment: Alignment.center,
   ),
 ];
@@ -72,14 +79,14 @@ const _kSteps = [
 // ── Provider ──────────────────────────────────────────────────────────────────
 
 final tutorialVisibleProvider = StateProvider<bool>((ref) => false);
-final tutorialStepProvider    = StateProvider<int>((ref) => 0);
+final tutorialStepProvider = StateProvider<int>((ref) => 0);
 
 class TutorialController {
   static const _kPrefKey = 'wois_tutorial_done';
 
   static Future<void> showIfFirstRun(WidgetRef ref) async {
     final prefs = await SharedPreferences.getInstance();
-    final done  = prefs.getBool(_kPrefKey) ?? false;
+    final done = prefs.getBool(_kPrefKey) ?? false;
     if (!done) {
       ref.read(tutorialStepProvider.notifier).state = 0;
       ref.read(tutorialVisibleProvider.notifier).state = true;
@@ -107,7 +114,7 @@ class TutorialOverlay extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final visible = ref.watch(tutorialVisibleProvider);
-    final step    = ref.watch(tutorialStepProvider);
+    final step = ref.watch(tutorialStepProvider);
 
     return Stack(
       children: [
@@ -125,7 +132,7 @@ class _TutorialCard extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final s   = _kSteps[step];
+    final s = _kSteps[step];
     final isLast = step == total - 1;
 
     return GestureDetector(
@@ -139,8 +146,13 @@ class _TutorialCard extends ConsumerWidget {
               padding: const EdgeInsets.all(24),
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 300),
-                child: _Card(key: ValueKey(step), s: s, step: step,
-                    total: total, isLast: isLast, ref_: ref),
+                child: _Card(
+                    key: ValueKey(step),
+                    s: s,
+                    step: step,
+                    total: total,
+                    isLast: isLast,
+                    ref_: ref),
               ),
             ),
           ),
@@ -172,7 +184,8 @@ class _Card extends ConsumerWidget {
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF00D4FF).withAlpha(120), width: 1.5),
+        border: Border.all(
+            color: const Color(0xFF00D4FF).withAlpha(120), width: 1.5),
         boxShadow: [
           BoxShadow(
             color: const Color(0xFF00D4FF).withAlpha(40),
@@ -187,18 +200,20 @@ class _Card extends ConsumerWidget {
           // Progress dots
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: List.generate(total, (i) => AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              margin: const EdgeInsets.symmetric(horizontal: 3),
-              width: i == step ? 18 : 6,
-              height: 6,
-              decoration: BoxDecoration(
-                color: i == step
-                    ? const Color(0xFF00D4FF)
-                    : const Color(0xFF30363D),
-                borderRadius: BorderRadius.circular(3),
-              ),
-            )),
+            children: List.generate(
+                total,
+                (i) => AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      margin: const EdgeInsets.symmetric(horizontal: 3),
+                      width: i == step ? 18 : 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: i == step
+                            ? const Color(0xFF00D4FF)
+                            : const Color(0xFF30363D),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    )),
           ),
           const SizedBox(height: 20),
 
@@ -247,18 +262,23 @@ class _Card extends ConsumerWidget {
                   onPressed: () => TutorialController.dismiss(ref),
                   child: const Text(
                     'SKIP TOUR',
-                    style: TextStyle(fontSize: 10, color: Color(0xFF484F58), letterSpacing: 1),
+                    style: TextStyle(
+                        fontSize: 10,
+                        color: Color(0xFF484F58),
+                        letterSpacing: 1),
                   ),
                 ),
               const Spacer(),
               // Back
               if (step > 0)
                 OutlinedButton(
-                  onPressed: () => ref.read(tutorialStepProvider.notifier).state = step - 1,
+                  onPressed: () =>
+                      ref.read(tutorialStepProvider.notifier).state = step - 1,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: const Color(0xFF8B949E),
                     side: const BorderSide(color: Color(0xFF30363D)),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 10),
                     textStyle: const TextStyle(fontSize: 11),
                   ),
                   child: const Text('BACK'),
@@ -268,12 +288,15 @@ class _Card extends ConsumerWidget {
               FilledButton(
                 onPressed: isLast
                     ? () => TutorialController.dismiss(ref)
-                    : () => ref.read(tutorialStepProvider.notifier).state = step + 1,
+                    : () => ref.read(tutorialStepProvider.notifier).state =
+                        step + 1,
                 style: FilledButton.styleFrom(
                   backgroundColor: const Color(0xFF00D4FF),
                   foregroundColor: const Color(0xFF0D1117),
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                  textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  textStyle: const TextStyle(
+                      fontSize: 11, fontWeight: FontWeight.bold),
                 ),
                 child: Text(isLast ? "LET'S GO!" : 'NEXT'),
               ),
