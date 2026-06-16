@@ -22,10 +22,11 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-// dart:js gives direct access to the browser's window object for the
-// sendBeacon registration helper defined in web/index.html.
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:js' as js;
+// Cross-platform JS bridge: web builds get a real sendBeacon via
+// dart:js_interop; Android / iOS / desktop / test builds get a no-op
+// stub so the file compiles cleanly on every target.
+import 'js_bridge_stub.dart'
+    if (dart.library.js_interop) 'js_bridge_web.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
@@ -149,8 +150,9 @@ class ScoutBot {
       for (var dc = -1; dc <= 1; dc++) {
         final nr = r + dr;
         final nc = c + dc;
-        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols)
+        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols) {
           continue;
+        }
         final key = '$nr,$nc';
         if (!existing.contains(key)) revealed.add(key);
       }
@@ -167,8 +169,9 @@ class ScoutBot {
         if (dr == 0 && dc == 0) continue;
         final nr = tr + dr;
         final nc = tc + dc;
-        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols)
+        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols) {
           continue;
+        }
         if (!explored.contains('$nr,$nc')) return true;
       }
     }
@@ -238,7 +241,8 @@ class RobotScoutSimulation {
     String? backendBase,
   }) : backendBase = backendBase ?? gatewayBaseUrl {
     _buildBots();
-    _seedInitialReveal();
+    // No initial reveal — robots must physically move to a cell before it
+    // is revealed. The warehouse starts in complete fog-of-war.
   }
 
   final WarehouseConfig config;
@@ -375,6 +379,17 @@ class RobotScoutSimulation {
       }
       _recordDiscoveriesAt(bot.row, bot.col, bot.id);
     }
+
+    // Tick inbound & putaway controllers (AI auto-execution)
+    final inboundCtrl = ref.read(inboundOpsControllerProvider);
+    if (inboundCtrl != null) {
+      inboundCtrl.tick();
+    }
+    final putawayCtrl = ref.read(palletPutawayControllerProvider);
+    if (putawayCtrl != null) {
+      putawayCtrl.tick();
+    }
+
     // Early flush: if the cache is full, send now without waiting for the timer.
     if (_cache.length >= _cacheCap) _flush();
   }
@@ -387,8 +402,9 @@ class RobotScoutSimulation {
       for (var dc = -1; dc <= 1; dc++) {
         final nr = r + dr;
         final nc = c + dc;
-        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols)
+        if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols) {
           continue;
+        }
         final cell = _cellAt(nr, nc);
         if (cell == null) continue;
 
@@ -485,8 +501,7 @@ class RobotScoutSimulation {
     if (kIsWeb) {
       // sendBeacon: browser-managed, non-blocking, survives navigation.
       try {
-        js.context.callMethod(
-            'woisSendBeacon', ['$backendBase/api/scout-report', payload]);
+        sendBeaconViaJs('$backendBase/api/scout-report', payload);
         return; // done — browser handles delivery
       } catch (_) {
         // JS bridge unavailable (unit-test) — fall through to HTTP.
