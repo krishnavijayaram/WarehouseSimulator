@@ -430,33 +430,38 @@ class _WarehouseCreatorScreenState
 
     final cfg = _buildConfig();
     ref.read(warehouseConfigProvider.notifier).state = cfg;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('warehouse_config', cfg.toShareCode());
-    await prefs.setString('warehouse_published', cfg.toShareCode());
-    await prefs.setString(
-        'warehouse_autosave', cfg.toShareCode()); // keep in sync
-    if (!mounted) return;
 
-    // Persist warehouse to backend DB so robot observations, WMS dashboard,
-    // and FLEET tabs all have a warehouse record to associate with.
-    final auth = ref.read(authProvider);
-    final userId = auth is AuthLoggedIn ? auth.user.id : 'local';
+    // Capture navigator + messenger BEFORE any await so they remain valid
+    // even if the widget tree rebuilds or navigates away during the async gap.
+    final navigator = Navigator.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+
     try {
-      final result = await ApiClient.instance.publishWarehouse(
-        warehouseId: cfg.id,
-        name: cfg.name,
-        configJson: cfg.toShareCode(),
-        ownerId: userId,
-      );
-      debugPrint(
-        '✅ Warehouse persisted to DB: id=${cfg.id} '
-        'cells=${result['cells_seeded']} robots=${result['robots_seeded']} '
-        'trucks=${result['trucks_seeded'] ?? 0}',
-      );
-    } catch (e) {
-      debugPrint('⚠️  Backend warehouse publish failed (offline mode): $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('warehouse_config', cfg.toShareCode());
+      await prefs.setString('warehouse_published', cfg.toShareCode());
+      await prefs.setString(
+          'warehouse_autosave', cfg.toShareCode()); // keep in sync
+
+      // Persist warehouse to backend DB so robot observations, WMS dashboard,
+      // and FLEET tabs all have a warehouse record to associate with.
+      final auth = ref.read(authProvider);
+      final userId = auth is AuthLoggedIn ? auth.user.id : 'local';
+      try {
+        final result = await ApiClient.instance.publishWarehouse(
+          warehouseId: cfg.id,
+          name: cfg.name,
+          configJson: cfg.toShareCode(),
+          ownerId: userId,
+        );
+        debugPrint(
+          '✅ Warehouse persisted to DB: id=${cfg.id} '
+          'cells=${result['cells_seeded']} robots=${result['robots_seeded']} '
+          'trucks=${result['trucks_seeded'] ?? 0}',
+        );
+      } catch (e) {
+        debugPrint('⚠️  Backend warehouse publish failed (offline mode): $e');
+        messenger.showSnackBar(SnackBar(
           content: const Text(
               'Backend offline — exploring in local mode.\nInventory will sync when the backend is available.'),
           backgroundColor: const Color(0xFF1C3A4F),
@@ -470,28 +475,42 @@ class _WarehouseCreatorScreenState
         // Fall through — allow ops to start using local state even if backend
         // is unreachable.  Discoveries will sync on the next successful flush.
       }
+
+      // Reset all ops state so the floor goes dark again.
+      ref.read(operationsStartedProvider.notifier).state = false;
+      ref.read(exploredCellsProvider.notifier).reset();
+      ref.read(activeEventsProvider.notifier).resolveAll();
+      ref.invalidate(inboundTrucksProvider);
+      final prevSim = ref.read(scoutSimulationProvider);
+      prevSim?.dispose();
+      ref.read(scoutSimulationProvider.notifier).state = null;
+
+      messenger.showSnackBar(const SnackBar(
+        content: Text('Published \u2014 choose a mode to start operations'),
+        backgroundColor: Color(0xFF1C3A4F),
+        duration: Duration(seconds: 2),
+      ));
+
+      // Show start-operations dialog (non-dismissible until user picks a mode).
+      // Use navigator.overlay!.context — a context INSIDE the GoRouter navigator
+      // rather than navigator.context (which is the navigator widget's own context,
+      // above which no further Navigator exists, causing showDialog to throw).
+      final overlayCtx = navigator.overlay?.context;
+      if (overlayCtx != null) {
+        await showDialog<void>(
+          context: overlayCtx,
+          barrierDismissible: false,
+          builder: (_) => _StartOpsDialog(config: cfg),
+        );
+      }
+    } catch (e, st) {
+      debugPrint('_publish error: $e\n$st');
+      messenger.showSnackBar(SnackBar(
+        content: Text('Publish error: $e'),
+        backgroundColor: const Color(0xFFFF4444),
+        duration: const Duration(seconds: 6),
+      ));
     }
-    if (!mounted) return;
-    // Reset all ops state so the floor goes dark again.
-    ref.read(operationsStartedProvider.notifier).state = false;
-    ref.read(exploredCellsProvider.notifier).reset();
-    ref.read(activeEventsProvider.notifier).resolveAll();
-    final prevSim = ref.read(scoutSimulationProvider);
-    prevSim?.dispose();
-    ref.read(scoutSimulationProvider.notifier).state = null;
-
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text('Published \u2014 choose a mode to start operations'),
-      backgroundColor: Color(0xFF1C3A4F),
-      duration: Duration(seconds: 2),
-    ));
-
-    // Show start-operations dialog (non-dismissible until user picks a mode)
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => _StartOpsDialog(config: cfg),
-    );
   }
   // ── Save / share ─────────────────────────────────────────────────────────
 

@@ -69,6 +69,34 @@ class ApiClient {
     return _check(r);
   }
 
+  // ── Session time limits ───────────────────────────────────────────────────
+
+  /// POST /api/v1/simulation/session/register — register session on ops start.
+  /// Returns {max_secs: int|null, is_privileged: bool}.
+  Future<Map<String, dynamic>> registerSimSession({
+    required String sessionId,
+    required String email,
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/simulation/session/register'),
+      headers: _headers,
+      body: jsonEncode({'session_id': sessionId, 'email': email}),
+    );
+    return _check(r);
+  }
+
+  /// GET /api/v1/simulation/session/status — poll remaining seconds.
+  /// Returns {remaining_secs: int|null, is_privileged: bool, registered: bool}.
+  Future<Map<String, dynamic>> getSessionStatus(String sessionId) async {
+    final r = await http.get(
+      _uri('/api/v1/simulation/session/status', {'session_id': sessionId}),
+      headers: _headers,
+    );
+    return _check(r);
+  }
+
+  // ── Game mode ─────────────────────────────────────────────────────────────
+
   /// Returns the current game-mode string (e.g. "OPTION_1").
   Future<String> getGameMode() async {
     final d = await getSimMode();
@@ -305,6 +333,25 @@ class ApiClient {
 
   // ── Warehouse lifecycle ───────────────────────────────────────────────────
 
+  /// GET /api/v1/warehouses?owner_id=… — list all warehouses owned by a user.
+  /// Returns the raw list of warehouse summary maps from the backend.
+  Future<List<Map<String, dynamic>>> getWarehousesByOwner(
+      String ownerId) async {
+    try {
+      final r = await http.get(
+        _uri('/api/v1/warehouses', {'owner_id': ownerId}),
+        headers: _headers,
+      );
+      if (r.statusCode >= 200 && r.statusCode < 300) {
+        final data = jsonDecode(r.body) as Map<String, dynamic>;
+        return (data['warehouses'] as List).cast<Map<String, dynamic>>();
+      }
+      return [];
+    } catch (_) {
+      return [];
+    }
+  }
+
   /// GET /api/v1/warehouses/{id} — check if the warehouse is in the DB.
   Future<Map<String, dynamic>?> getWarehouseStatus(String warehouseId) async {
     try {
@@ -500,6 +547,41 @@ class ApiClient {
     );
     final d = _check(r);
     return (d['cells'] as List? ?? []).cast<Map<String, dynamic>>();
+  }
+
+  /// POST /api/v1/reality/explore
+  /// Tap a cell in Reality view → syncs that cell's Reality data into WMS.
+  /// Returns `{status, reality, wms_before, wms_after, had_discrepancy}`.
+  Future<Map<String, dynamic>> exploreCell({
+    required String warehouseId,
+    required int row,
+    required int col,
+    String exploredBy = 'MANUAL_EXPLORE',
+  }) async {
+    final r = await http.post(
+      _uri('/api/v1/reality/explore'),
+      headers: _headers,
+      body: jsonEncode({
+        'warehouse_id': warehouseId,
+        'row': row,
+        'col': col,
+        'explored_by': exploredBy,
+      }),
+    );
+    return _check(r);
+  }
+
+  /// GET /api/v1/reality/divergences?warehouse_id=…
+  /// Returns cells where Reality qty ≠ WMS qty.
+  /// Each element: `{row, col, sku_id, reality_qty, wms_qty, wms_confidence, delta}`.
+  Future<List<Map<String, dynamic>>> getRackDivergences(
+      String warehouseId) async {
+    final r = await http.get(
+      _uri('/api/v1/reality/divergences', {'warehouse_id': warehouseId}),
+      headers: _headers,
+    );
+    final d = _check(r);
+    return (d['divergences'] as List? ?? []).cast<Map<String, dynamic>>();
   }
 
   // ── Orders (Inbound / Outbound) ───────────────────────────────────────────

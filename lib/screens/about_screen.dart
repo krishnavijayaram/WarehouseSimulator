@@ -56,7 +56,7 @@ class AboutScreen extends ConsumerWidget {
                 const SizedBox(height: 20),
                 _projectCard(),
                 const SizedBox(height: 20),
-                _Card(child: const MyAppsSection()),
+                const _Card(child: MyAppsSection()),
                 const SizedBox(height: 20),
                 _communityCtaCard(context),
                 const SizedBox(height: 16),

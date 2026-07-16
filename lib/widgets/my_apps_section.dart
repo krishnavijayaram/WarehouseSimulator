@@ -14,11 +14,11 @@ const kAppsManifestUrl =
     'https://sanatanaapistore.blob.core.windows.net/apps-manifest/apps.json';
 
 // ── Brand palette (matches about_screen.dart) ─────────────────────────────────
-const _bg    = Color(0xFF0A0E1A);
-const _card  = Color(0xFF1E293B);
+const _bg = Color(0xFF0A0E1A);
+const _card = Color(0xFF1E293B);
 const _border = Color(0xFF374151);
-const _cyan  = Color(0xFF22D3EE);
-const _text  = Color(0xFFE2E8F0);
+const _cyan = Color(0xFF22D3EE);
+const _text = Color(0xFFE2E8F0);
 const _muted = Color(0xFF6B7280);
 
 // ── Hex → Color ───────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ class _MyAppsSectionState extends State<MyAppsSection> {
             const Icon(Icons.apps_rounded, size: 16, color: _cyan),
             const SizedBox(width: 8),
             const Text(
-              'MY APPS',
+              'MY OTHER APPS',
               style: TextStyle(
                   fontSize: 11,
                   color: _cyan,
@@ -101,8 +101,8 @@ class _MyAppsSectionState extends State<MyAppsSection> {
               return const Center(
                 child: Padding(
                   padding: EdgeInsets.symmetric(vertical: 32),
-                  child: CircularProgressIndicator(
-                      color: _cyan, strokeWidth: 2),
+                  child:
+                      CircularProgressIndicator(color: _cyan, strokeWidth: 2),
                 ),
               );
             }
@@ -110,18 +110,20 @@ class _MyAppsSectionState extends State<MyAppsSection> {
               return Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: Colors.red.withAlpha(20),
+                  color: const Color(0xFF1C2A1C),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.red.withAlpha(60)),
+                  border:
+                      Border.all(color: const Color(0xFF2EA043).withAlpha(80)),
                 ),
                 child: const Row(
                   children: [
-                    Icon(Icons.wifi_off, color: Colors.redAccent, size: 18),
+                    Icon(Icons.rocket_launch_outlined,
+                        color: Color(0xFF3FB950), size: 18),
                     SizedBox(width: 10),
                     Expanded(
-                      child: Text('Unable to load apps — check network',
+                      child: Text('Coming soon — Mid June',
                           style: TextStyle(
-                              color: Colors.redAccent, fontSize: 12)),
+                              color: Color(0xFF3FB950), fontSize: 12)),
                     ),
                   ],
                 ),
@@ -157,17 +159,17 @@ class AppCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final name        = app['name']        as String? ?? '';
-    final tagline     = app['tagline']     as String? ?? '';
+    final name = app['name'] as String? ?? '';
+    final tagline = app['tagline'] as String? ?? '';
     final description = app['description'] as String? ?? '';
-    final category    = app['category']    as String? ?? '';
-    final iconUrl     = app['iconUrl']     as String?;
-    final bannerHex   = app['bannerColor'] as String? ?? '#22D3EE';
+    final category = app['category'] as String? ?? '';
+    final iconUrl = app['iconUrl'] as String?;
+    final bannerHex = app['bannerColor'] as String? ?? '#22D3EE';
     final playStoreUrl = app['playStoreUrl'] as String?;
-    final appStoreUrl  = app['appStoreUrl']  as String?;
-    final isLive      = app['isLive']      as bool?   ?? false;
-    final tags        = (app['tags'] as List?)?.cast<String>() ?? [];
-    final banner      = parseHexColor(bannerHex);
+    final appStoreUrl = app['appStoreUrl'] as String?;
+    final isLive = app['isLive'] as bool? ?? false;
+    final tags = (app['tags'] as List?)?.cast<String>() ?? [];
+    final banner = parseHexColor(bannerHex);
 
     return Container(
       decoration: BoxDecoration(
@@ -175,8 +177,7 @@ class AppCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: _border),
         boxShadow: const [
-          BoxShadow(
-              color: Colors.black26, blurRadius: 12, offset: Offset(0, 4))
+          BoxShadow(color: Colors.black26, blurRadius: 12, offset: Offset(0, 4))
         ],
       ),
       clipBehavior: Clip.antiAlias,
@@ -185,8 +186,7 @@ class AppCard extends StatelessWidget {
         children: [
           // ── Banner ────────────────────────────────────────────────────────
           Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 colors: [banner, banner.withAlpha(180)],
@@ -309,8 +309,7 @@ class AppCard extends StatelessWidget {
                               decoration: BoxDecoration(
                                 color: banner.withAlpha(22),
                                 borderRadius: BorderRadius.circular(4),
-                                border:
-                                    Border.all(color: banner.withAlpha(80)),
+                                border: Border.all(color: banner.withAlpha(80)),
                               ),
                               child: Text(t,
                                   style: TextStyle(

@@ -9,6 +9,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/auth/auth_provider.dart';
 import '../core/sim_ws.dart';
@@ -1643,8 +1644,8 @@ class _RightChatPanelState extends ConsumerState<_RightChatPanel> {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             color: const Color(0xFF0B1A0B),
-            child: Row(
-              children: const [
+            child: const Row(
+              children: [
                 Text('🚧', style: TextStyle(fontSize: 11)),
                 SizedBox(width: 6),
                 Expanded(
@@ -2163,8 +2164,8 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
       // Step 2: Robot next to docked truck, not carrying anything → Unload.
       // Step 3: Robot carrying a pallet, next to staging → Drop.
       final cargoMap = ref.read(robotCargoProvider);
-      final _ctxDbId = _resolveDbRobotId(robot.id);
-      final pallet = cargoMap[_ctxDbId];
+      final ctxDbId = _resolveDbRobotId(robot.id);
+      final pallet = cargoMap[ctxDbId];
       if (pallet == null) {
         // No pallet loaded — show Unload option if adjacent to a docked truck.
         final trucks =
@@ -3202,6 +3203,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                                     config, // always draw layout as preview
                                 exploredCells:
                                     opsStarted ? exploredCells : const {},
+                                fogEnabled: opsStarted,
                                 activeEvents: activeEvents,
                                 blinkPhase: _blinkAnim.value,
                                 selectedRobotId: selectedRobotId,
@@ -3529,6 +3531,12 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   ref
                       .read(manualRobotControllerProvider.notifier)
                       .initialize(config);
+                  // Persist ops-started so fog survives page refresh.
+                  SharedPreferences.getInstance().then((prefs) {
+                    prefs.setBool('ops_started', true);
+                    prefs.setString('ops_warehouse_id', config.id);
+                    prefs.remove('explored_cells_${config.id}');
+                  });
                   // Seed the blocked-cells overlay from the backend.
                   ref.read(blockedCellsProvider.notifier).refresh(config.id);
                   // Create the simulation (needed for the STEP button and

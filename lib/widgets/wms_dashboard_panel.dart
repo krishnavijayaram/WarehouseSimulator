@@ -82,8 +82,8 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
   @override
   void didUpdateWidget(_ScoutingPanel old) {
     super.didUpdateWidget(old);
-    // Warehouse was re-published with a new ID — reset and re-check.
-    if (old.config.id != widget.config.id) {
+    // Warehouse was re-published (new ID or same ID) — reset and re-check.
+    if (old.config != widget.config) {
       setState(() {
         _warehouseStatus = null;
         _whChecked = false;
@@ -984,9 +984,9 @@ class _WmsTruckCard extends StatelessWidget {
                       if (picked > 0) ...[
                         const SizedBox(width: 6),
                         Text(
-                          '−$picked',
+                          '$picked unloaded',
                           style: const TextStyle(
-                              fontSize: 9, color: Color(0xFFFF8800)),
+                              fontSize: 9, color: Color(0xFF00FF88)),
                         ),
                       ],
                     ]),
