@@ -174,6 +174,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   // ── Inbound truck polling ────────────────────────────────────────────────
 
   Future<void> _pollInboundTrucks() async {
+    if (!_isSimOwner) return; // static view for everyone else — no backend polling
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) {
       // Retry once more in case the config just loaded
@@ -224,6 +225,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   /// claim (or be denied) the edit lock, then repeats every 45 s.
   /// The backend LOCK_TTL_SECS = 60 s — 45 s keeps us comfortably inside it.
   Future<void> _startHeartbeat(WarehouseConfig config) async {
+    if (!_isSimOwner) return; // non-owners hold no edit lock and do no polling
     _stopHeartbeat(); // cancel any previous timer (e.g. after re-publish)
     _heartbeatWarehouseId = config.id;
     await _sendHeartbeat(config.id);
@@ -295,6 +297,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   }
 
   Future<void> _pollDivergences() async {
+    if (!_isSimOwner) return; // static view for everyone else — no backend polling
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) return;
     try {
@@ -327,10 +330,25 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     } catch (_) {}
   }
 
+  /// The LIVE simulator + all its backend polling run for the single owner
+  /// account only; every other visitor sees a frozen static view. This bounds all
+  /// dynamic DB traffic to one session — the deliberate EX-safety cap ("one
+  /// connection is enough"): one active user cannot exhaust the shared pool.
+  /// NOTE: a client-side gate is not a security boundary (the enforced guarantee
+  /// is still the Postgres role CONNECTION LIMIT); it is what makes the app quiet
+  /// for everyone else.
+  bool get _isSimOwner {
+    final auth = ref.read(authProvider);
+    return auth is AuthLoggedIn && auth.user.isPrivileged;
+  }
+
   /// Actually starts bots and the scout simulation. Separated so it can be
   /// called both from Start Operations (EDITOR path) and from a heartbeat
   /// that discovers the previous editor left.
   void _launchSimulation(WarehouseConfig config) {
+    // Only the owner runs the live sim; everyone else gets the static warehouse
+    // (no sim → robots render at their static spawns, nothing moves).
+    if (!_isSimOwner) return;
     final prevSim = ref.read(scoutSimulationProvider);
     prevSim?.dispose();
     final scout = RobotScoutSimulation(
@@ -865,6 +883,31 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                 ),
               ),
 
+            // ── Static-view banner ───────────────────────────────────────────
+            // Non-owners see a frozen warehouse (no live sim, no polling) so all
+            // dynamic DB traffic stays on the owner's single session.
+            if (!_isSimOwner)
+              Positioned(
+                top: 12,
+                left: 12,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B).withAlpha(230),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF334155)),
+                  ),
+                  child: const Text(
+                    'Static view — live simulation runs on the owner\'s session',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF94A3B8),
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+
             // ── Hover tooltip ────────────────────────────────────────────────
             if (_hoverLocal != null)
               _buildHoverTooltip(frame, config, displayRobots),
@@ -993,7 +1036,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                       PalletPutawayController(config: config, ref: ref);
 
                   // Hydrate robot cargo from backend
-                  ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+                  if (_isSimOwner) {
+                    ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+                  }
 
                   // Claim the edit lock via heartbeat first.
                   // EDITOR → launch bots immediately.
@@ -1235,7 +1280,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
               PalletPutawayController(config: config, ref: ref);
 
           // Hydrate robot cargo from backend (transactional source of truth)
-          ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+          if (_isSimOwner) {
+            ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+          }
 
           await _startHeartbeat(config);
           final access = ref.read(editAccessProvider);
