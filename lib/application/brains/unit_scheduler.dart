@@ -101,10 +101,17 @@ class UnitScheduler {
       final order = snapshot.orders[oid];
       final dead = order == null || order.status == OrderStatus.aborted;
       if (!dead) continue;
-      // A claimed pickToStage is still being driven by a live picker — leave it;
-      // its eventual packAndLoad is reclaimed next pass. Only reclaim work that is
-      // parked (a staged pallet awaiting load, or an unclaimed pick).
-      if (job.kind == JobKind.pickToStage &&
+      // Only reclaim PARKED work — an unclaimed pick, or an unclaimed packAndLoad
+      // (a staged pallet no outbound robot has taken yet). Work a live unit is
+      // still driving is left to that unit: a claimed pickToStage's eventual
+      // packAndLoad is caught next pass, and a claimed/active packAndLoad's robot
+      // owns its own staged pallet (it removes it via takeFromStage). Reclaiming a
+      // mid-load packAndLoad would take the pallet out from under the robot and
+      // free the cell, letting a DIFFERENT healthy order stage onto it — the
+      // robot would then ship the wrong pallet and that healthy order would fail
+      // with its stock lost (review: exactly-once inventory).
+      if ((job.kind == JobKind.pickToStage ||
+              job.kind == JobKind.packAndLoad) &&
           job.status != JobStatus.unclaimed) {
         continue;
       }

@@ -47,6 +47,12 @@ class InboundTruckBrain extends UnitBrain {
   List<GridPos> _path = const [];
   int _pathIdx = 0;
 
+  /// A truck that can never reach a bay must remove itself, or orphaned trucks
+  /// pile up in the registry (which is iterated in full every phase every tick)
+  /// and a long run creeps toward stall. Mirrors OutboundTruckBrain's kMaxSeekTicks.
+  static const int kMaxSeekTicks = 120;
+  int _seekTicks = 0;
+
   @override
   void perceiveAndDecide(BrainContext ctx) {
     if (_state != _IT.seekingBay) return;
@@ -77,6 +83,13 @@ class InboundTruckBrain extends UnitBrain {
     switch (_state) {
       case _IT.seekingBay:
         lifecycle = UnitLifecycle.idle;
+        if (++_seekTicks > kMaxSeekTicks) {
+          // Never found a reachable free bay — remove self so orphaned trucks
+          // can't accumulate, and abort the replenish Order so StockMonitor's
+          // inFlight slot frees for a fresh attempt.
+          if (orderId != null) ctx.board.closeOrder(orderId!, aborted: true);
+          ctx.ref.read(unitRegistryProvider.notifier).remove(id);
+        }
 
       case _IT.driving:
         if (_advance(applier)) {

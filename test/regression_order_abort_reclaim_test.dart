@@ -73,4 +73,53 @@ void main() {
     expect(j == null || j.status == JobStatus.failed, isTrue,
         reason: 'the orphaned load Job is failed (or swept), not left claimable forever');
   });
+
+  testWidgets('reclaim must NOT seize a CLAIMED packAndLoad a robot is loading',
+      (tester) async {
+    // The blocker-hunt regression: reclaiming an active packAndLoad would take the
+    // pallet out from under the outbound robot and free the cell, so a different
+    // healthy order could stage onto it and the robot would ship the wrong pallet.
+    // A claimed/active load Job (and its staged pallet) must be left to its robot.
+    final config = _cfg();
+    late WidgetRef ref;
+    await tester.pumpWidget(
+      ProviderScope(
+        child: Consumer(builder: (_, r, __) {
+          ref = r;
+          return const SizedBox();
+        }),
+      ),
+    );
+    final board = ref.read(jobBoardProvider.notifier);
+    ref.read(warehouseConfigProvider.notifier).state = config;
+
+    final order = board.mintOrder(
+      kind: OrderKind.outboundShip,
+      skuId: 'SKU1',
+      orderedUnits: kLoosePerPallet,
+      nowTick: 0,
+    );
+    ref.read(outboundStageProvider.notifier).place(0, 3, 'SKU1');
+    final load = board.mintJobOf(
+      kind: JobKind.packAndLoad,
+      requiredRole: UnitRole.outboundRobot,
+      skuId: 'SKU1',
+      orderId: order.id,
+      lineId: 'L0',
+      src: (row: 0, col: 3),
+      qtyUnits: kLoosePerPallet,
+    );
+    // A robot has claimed + is actively running this load.
+    board.claim(load.id, 'OR1');
+    board.markActive(load.id);
+    board.closeOrder(order.id, aborted: true);
+
+    UnitScheduler(ref).tick(config, 1);
+
+    // The pallet stays put and the Job is NOT failed — its robot still owns it.
+    expect(ref.read(outboundStageProvider).isNotEmpty, isTrue,
+        reason: 'a claimed load\'s staged pallet must stay for its robot, not be seized');
+    expect(ref.read(jobBoardProvider).jobs[load.id]?.status, JobStatus.active,
+        reason: 'the active load Job is left to its robot, not failed by reclaim');
+  });
 }
