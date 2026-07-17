@@ -64,14 +64,60 @@ enum OrderKind { inboundReplenish, outboundShip }
 
 enum OrderStatus { open, fulfilling, closed, aborted }
 
-/// One demand line of an outbound Order (a SKU pulled in a specific UOM).
+/// One demand line of an Order: a SKU pulled in a SPECIFIC UOM.
+///
+/// This is how "route as pallet, case, loose" is represented: an outbound Order
+/// explodes into one line per UOM, and each line is claimed by the picker that
+/// handles that UOM — so pallet/case/loose pickers work the SAME order
+/// concurrently, then it groups at the shipping area before loading.
+///
+/// The lines are the single source of truth for progress; the Order derives its
+/// counters from them, so there is still exactly ONE place a unit is counted
+/// (the invariant LCC-2 protects — no second decrement site).
 class OrderLine {
-  OrderLine({required this.id, required this.uom, required this.units});
-  final String id;
+  OrderLine({
+    required this.lineId,
+    required this.skuId,
+    required this.uom,
+    required this.units,
+  });
+
+  final String lineId;
+  final String skuId;
   final UomKind uom;
 
   /// Ordered quantity for this line, in LOOSE-equivalent units.
   final int units;
+
+  /// Units shipped for THIS line (loose-equiv). Monotonic ↑.
+  int _progressUnits = 0;
+  int get progressUnits => _progressUnits;
+
+  /// Units satisfied by a 5.1 cross-dock diversion instead of a rack pick.
+  int _divertedUnits = 0;
+  int get divertedUnits => _divertedUnits;
+
+  /// Units of this line physically sitting at the shipping area, awaiting the
+  /// group. The spec-2 consolidation gate reads this — NOT progress, which only
+  /// advances once the goods actually leave on a truck.
+  int stagedUnits = 0;
+
+  int get remainingUnits =>
+      (units - _progressUnits - _divertedUnits).clamp(0, units);
+  bool get isSatisfied => remainingUnits == 0;
+  bool get isFullyStaged => stagedUnits + _progressUnits + _divertedUnits >= units;
+
+  void advanceProgress(int looseUnits) {
+    if (looseUnits <= 0) return;
+    _progressUnits =
+        (_progressUnits + looseUnits).clamp(0, units - _divertedUnits);
+  }
+
+  void divert(int looseUnits) {
+    if (looseUnits <= 0) return;
+    _divertedUnits =
+        (_divertedUnits + looseUnits).clamp(0, units - _progressUnits);
+  }
 }
 
 /// A demand emitted by the system. Progress is tracked by ONE monotonic counter
@@ -81,18 +127,12 @@ class Order {
   Order({
     required this.id,
     required this.kind,
-    required this.skuId,
-    required this.orderedUnits,
     required this.createdTick,
-    List<OrderLine>? lines,
-  }) : lines = lines ?? const [];
+    required this.lines,
+  }) : assert(lines.isNotEmpty, 'an Order must have at least one line');
 
   final String id;
   final OrderKind kind;
-  final String skuId;
-
-  /// Total demand in LOOSE-equivalent units (Σ lines for outbound).
-  final int orderedUnits;
   final List<OrderLine> lines;
   final int createdTick;
 
@@ -103,31 +143,72 @@ class Order {
   /// truck without ever referencing the truck brain (coordination via the board).
   GridPos? shipBay;
 
-  /// THE single authoritative progress counter (loose-equiv). Monotonic ↑.
-  /// Inbound: units actually put away to rack. Outbound: units actually shipped.
-  int _progressUnits = 0;
+  /// Outbound: the pooled truck carrying this order. Many orders share one truck,
+  /// which is what makes "depart when FULL" expressible.
+  String? assignedTruckId;
 
-  /// Cross-dock (v2 Amendment C): outbound units satisfied by a 5.1 inbound
-  /// diversion rather than a rack pick — counted here so pick demand shrinks.
-  int divertedUnits = 0;
+  /// Back-compat for the single-SKU paths (all inbound orders are one SKU).
+  String get skuId => lines.isEmpty ? '' : lines.first.skuId;
 
-  int get progressUnits => _progressUnits;
-
-  /// Derived, never stored twice.
-  int get remainingUnits =>
-      (orderedUnits - _progressUnits - divertedUnits).clamp(0, orderedUnits);
-
+  /// All counters DERIVE from the lines — the lines are the one source of truth,
+  /// so a unit is still counted in exactly one place (LCC-2).
+  int get orderedUnits => lines.fold(0, (s, l) => s + l.units);
+  int get progressUnits => lines.fold(0, (s, l) => s + l.progressUnits);
+  int get divertedUnits => lines.fold(0, (s, l) => s + l.divertedUnits);
+  int get remainingUnits => lines.fold(0, (s, l) => s + l.remainingUnits);
   bool get isSatisfied => remainingUnits == 0;
 
-  /// The single mutation point for progress. Clamped monotonic.
-  void advanceProgress(int looseUnits) {
-    if (looseUnits <= 0) return;
-    _progressUnits = (_progressUnits + looseUnits).clamp(0, orderedUnits);
+  /// spec-2 GROUPING gate: every line is accounted for at the shipping area, so
+  /// the order can be loaded as one group. Distinct from [isSatisfied], which is
+  /// a post-hoc "it all left on a truck" test.
+  int get stagedUnits => lines.fold(0, (s, l) => s + l.stagedUnits);
+  bool get isFullyStaged => lines.every((l) => l.isFullyStaged);
+
+  OrderLine? lineById(String? lineId) {
+    if (lineId == null) return null;
+    for (final l in lines) {
+      if (l.lineId == lineId) return l;
+    }
+    return null;
   }
 
-  void divert(int looseUnits) {
+  /// Progress mutation. Prefer passing [lineId] (a Job carries one); without it
+  /// the units fill unsatisfied lines in order, which is exact for the
+  /// single-line orders the inbound path mints.
+  void advanceProgress(int looseUnits, {String? lineId}) {
     if (looseUnits <= 0) return;
-    divertedUnits = (divertedUnits + looseUnits).clamp(0, orderedUnits);
+    final line = lineById(lineId);
+    if (line != null) {
+      line.advanceProgress(looseUnits);
+      return;
+    }
+    var left = looseUnits;
+    for (final l in lines) {
+      if (left <= 0) break;
+      final take = left < l.remainingUnits ? left : l.remainingUnits;
+      if (take <= 0) continue;
+      l.advanceProgress(take);
+      left -= take;
+    }
+  }
+
+  /// Cross-dock (5.1): outbound units satisfied by diverting an inbound pallet
+  /// straight to outbound staging rather than picking from a rack.
+  void divert(int looseUnits, {String? lineId}) {
+    if (looseUnits <= 0) return;
+    final line = lineById(lineId);
+    if (line != null) {
+      line.divert(looseUnits);
+      return;
+    }
+    var left = looseUnits;
+    for (final l in lines) {
+      if (left <= 0) break;
+      final take = left < l.remainingUnits ? left : l.remainingUnits;
+      if (take <= 0) continue;
+      l.divert(take);
+      left -= take;
+    }
   }
 }
 
@@ -138,6 +219,7 @@ enum JobKind {
   unloadTruck,
   putaway,
   rebalance, // rack→rack unwrap (v2 Amendment C: fixes UOM-locked starvation)
+  crossDock, // 5.1: an inbound pallet diverted straight to outbound staging
   pickToStage,
   packAndLoad,
   departTruck,
@@ -156,6 +238,7 @@ class Job {
     required this.requiredRole,
     required this.skuId,
     this.orderId,
+    this.lineId,
     this.requiredUom,
     this.idemKey,
     this.src,
@@ -171,6 +254,11 @@ class Job {
 
   /// Parent Order (null for order-less Jobs: rebalance, recovery, truck moves).
   final String? orderId;
+
+  /// The Order LINE this Job serves. Progress is attributed here first and then
+  /// rolls up, so a pallet/case/loose picker each credit their own line of the
+  /// same order instead of racing one shared counter.
+  final String? lineId;
 
   /// For pick Jobs, the UOM this Job draws (role gate is UOM-aware — SC-9).
   final UomKind? requiredUom;
@@ -253,18 +341,38 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
 
   // ── Minting ────────────────────────────────────────────────────────────────
 
+  /// Single-SKU, single-line convenience — the shape the inbound path mints.
+  /// [orderedUnits] is loose-equivalent; [uom] describes how it is pulled.
   Order mintOrder({
     required OrderKind kind,
     required String skuId,
     required int orderedUnits,
     required int nowTick,
-    List<OrderLine>? lines,
+    UomKind uom = UomKind.pallet,
+  }) =>
+      mintOrderOf(
+        kind: kind,
+        nowTick: nowTick,
+        lines: [
+          OrderLine(
+            lineId: 'L0',
+            skuId: skuId,
+            uom: uom,
+            units: orderedUnits,
+          ),
+        ],
+      );
+
+  /// Multi-line mint: one line per UOM is how an outbound order routes as
+  /// pallet + case + loose and is then grouped at the shipping area.
+  Order mintOrderOf({
+    required OrderKind kind,
+    required int nowTick,
+    required List<OrderLine> lines,
   }) {
     final order = Order(
       id: _nextId('ORD'),
       kind: kind,
-      skuId: skuId,
-      orderedUnits: orderedUnits,
       createdTick: nowTick,
       lines: lines,
     );
@@ -282,6 +390,7 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
     required UnitRole requiredRole,
     required String skuId,
     String? orderId,
+    String? lineId,
     UomKind? requiredUom,
     String? idemKey,
     GridPos? src,
@@ -295,6 +404,7 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
         requiredRole: requiredRole,
         skuId: skuId,
         orderId: orderId,
+        lineId: lineId,
         requiredUom: requiredUom,
         idemKey: idemKey,
         src: src,
@@ -390,7 +500,14 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
     j.settled = true;
     final order = j.orderId == null ? null : state.orders[j.orderId];
     if (order != null && progressUnits > 0) {
-      order.advanceProgress(progressUnits);
+      // Attribute to the Job's OWN line first, then roll up: a pallet, case and
+      // loose picker all serving one order each credit their own line instead of
+      // racing a single shared counter.
+      order.advanceProgress(progressUnits, lineId: j.lineId);
+      // `fulfilling` was declared and read but never assigned anywhere.
+      if (order.status == OrderStatus.open) {
+        order.status = OrderStatus.fulfilling;
+      }
       if (order.isSatisfied) order.status = OrderStatus.closed;
     }
     _touch();

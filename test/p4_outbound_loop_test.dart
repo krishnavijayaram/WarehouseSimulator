@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:warehouse_simulator/models/warehouse_config.dart';
 import 'package:warehouse_simulator/application/providers.dart';
 import 'package:warehouse_simulator/application/job_board.dart';
+import 'package:warehouse_simulator/application/sim_random.dart';
 import 'package:warehouse_simulator/application/bay_resource.dart';
 import 'package:warehouse_simulator/application/outbound_stage.dart';
 import 'package:warehouse_simulator/application/brains/unit_brain.dart';
@@ -58,8 +59,17 @@ void main() {
 
     ref.read(warehouseConfigProvider.notifier).state = config;
     ref.read(unitRegistryProvider.notifier)
-      ..register(
-          OutboundOrderGeneratorBrain(id: 'GEN', truckSpawn: (row: 1, col: 6)))
+      ..register(OutboundOrderGeneratorBrain(
+        id: 'GEN',
+        truckSpawn: (row: 1, col: 6),
+        // Pinned seed + single-unit lines: demand is seeded-random in the app, but
+        // this fixture pins the exact stream so the loop assertions stay exact.
+        // servableUoms mirrors the floor (one pallet rack) and the lone pallet
+        // picker below — the generator must never mint a UOM nobody can pick.
+        rng: SimRng(7),
+        servableUoms: const {UomKind.pallet},
+        maxUnitsPerLine: 1,
+      ))
       ..register(PickRobotBrain(id: 'PK1', pos: (row: 1, col: 0)))
       ..register(OutboundRobotBrain(id: 'OR1', pos: (row: 1, col: 4)));
 

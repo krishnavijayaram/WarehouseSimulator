@@ -92,7 +92,12 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     )..repeat(reverse: true);
     _blinkAnim = CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut);
     _truckPollTimer =
-        Timer.periodic(const Duration(seconds: 5), (_) => _pollInboundTrucks());
+        // 5min, not 5s: this poll was ~80% of all DB traffic (12 hits/min/user) on
+        // the Postgres instance shared with EventXplore. This is an academic sim —
+        // backend truck data being a few minutes stale is fine, and it cuts this
+        // poll's load by 60x. (Sim-spawned trucks are local and unaffected.)
+        Timer.periodic(
+            const Duration(minutes: 5), (_) => _pollInboundTrucks());
   }
 
   @override
@@ -284,7 +289,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     _divergenceTimer?.cancel();
     _pollDivergences();
     _divergenceTimer = Timer.periodic(
-        const Duration(seconds: 30), (_) => _pollDivergences());
+        // 10min, not 30s: background Reality↔WMS reconciliation is never urgent,
+        // and this shares a DB instance with EventXplore.
+        const Duration(minutes: 10), (_) => _pollDivergences());
   }
 
   Future<void> _pollDivergences() async {

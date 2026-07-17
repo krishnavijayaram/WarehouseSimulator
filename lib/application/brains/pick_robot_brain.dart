@@ -37,6 +37,23 @@ class PickRobotBrain extends UnitBrain {
   String? _jobId;
   String? _idemKey;
   String? _orderId;
+
+  /// The Order LINE this pick serves, so the load credits the right line of a
+  /// multi-line (pallet+case+loose) order rather than a shared counter.
+  String? _lineId;
+
+  /// The claimed Job's demand in loose-equiv. One trip moves at most ONE native
+  /// unit (a robot carries one pallet/case/handful), so a line larger than that
+  /// is minted as several Jobs — never silently under-delivered by one trip.
+  int _jobQty = 0;
+
+  /// Loose-equiv this trip legitimately carries: one native unit, capped by what
+  /// the Job actually asked for (so a 1-loose Job never credits a whole pallet).
+  int get _tripUnits {
+    final oneUnit = handledUom.looseUnits;
+    if (_jobQty <= 0) return oneUnit; // Job carried no qty → assume one unit
+    return _jobQty < oneUnit ? _jobQty : oneUnit;
+  }
   String _sku = '';
   GridPos? _rack;
   GridPos? _stage;
@@ -82,6 +99,8 @@ class PickRobotBrain extends UnitBrain {
       currentJobId = job.id;
       _idemKey = job.idemKey;
       _orderId = job.orderId;
+      _lineId = job.lineId;
+      _jobQty = job.qtyUnits;
       _sku = job.skuId;
       _rack = src;
       // Reserve the source face so no concurrent picker over-draws it (SBI-2).
@@ -169,10 +188,13 @@ class PickRobotBrain extends UnitBrain {
             requiredRole: UnitRole.outboundRobot,
             skuId: _sku,
             orderId: _orderId,
+            lineId: _lineId, // credit THIS line, not a shared order counter
             src: _stage,
-            // True loose-equiv of what was picked (pallet=48/case=4/loose=1) so
-            // the load credits the real quantity, not a fixed 48 (review AC-5).
-            qtyUnits: handledUom.looseUnits,
+            // What this trip actually moved: one native unit's loose-equiv
+            // (pallet=48/case=4/loose=1), never more than the Job asked for.
+            // A Job demanding more than one native unit is minted as several
+            // Jobs — one trip must never claim credit for units it didn't carry.
+            qtyUnits: _tripUnits,
           );
           ctx.board.completeJob(_jobId!); // Order advances at load, not here
           _reset();
@@ -256,6 +278,8 @@ class PickRobotBrain extends UnitBrain {
     _jobId = null;
     _idemKey = null;
     _orderId = null;
+    _lineId = null;
+    _jobQty = 0;
     currentJobId = null;
     _sku = '';
     _rack = null;

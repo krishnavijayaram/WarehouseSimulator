@@ -1,14 +1,24 @@
 /// outbound_order_generator_brain.dart — the outbound "system player" (step 9).
 ///
-/// The AoE player for shipping: while under a WIP cap and stock exists, it emits
-/// an outbound Order for a stocked SKU, its pick Job, and spawns the truck that
-/// will carry it out. Selection is deterministic (first stocked SKU) so runs are
-/// reproducible for the JEPA eval; a seeded-random demand pattern can layer on
-/// top later without changing the loop.
+/// The AoE player for shipping: on a jittered interval, while under a WIP cap, it
+/// emits a RANDOM outbound Order — random SKU, random UOM mix, random quantity —
+/// explodes it into one line per UOM (pallet / case / loose), mints one pick Job
+/// per native unit, and spawns the truck that carries it out.
+///
+/// Randomness is SEEDED and injected ([SimRng]), never a clock or a bare
+/// `Random()`, so demand looks random yet a run replays byte-identically — the
+/// property the JEPA eval depends on.
+///
+/// It only ever asks for a UOM in [servableUoms] (a picker handles it AND a rack
+/// type supplies it). Minting outside that set produces a Job no picker can claim,
+/// and `claimableFor` filters such a Job out BEFORE the attempts counter can fire
+/// the watchdog — so it would never be claimed, never fail, and pin its Order open
+/// forever, stalling the WIP cap and the whole outbound loop.
 library;
 
 import '../../models/warehouse_config.dart';
 import '../job_board.dart';
+import '../sim_random.dart';
 import 'outbound_truck_brain.dart';
 import 'unit_brain.dart';
 
@@ -16,18 +26,38 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
   OutboundOrderGeneratorBrain({
     required super.id,
     required this.truckSpawn,
-    this.wipCap = 1,
-    this.orderUnits = kLoosePerPallet,
-  }) : super(role: UnitRole.outboundGenerator, pos: const (row: -1, col: -1));
+    required this.rng,
+    Set<UomKind>? servableUoms,
+    this.wipCap = 3,
+    this.emitEveryTicks = 40,
+    this.emitJitterTicks = 15,
+    this.maxUnitsPerLine = 2,
+  })  : servableUoms = servableUoms ?? const {UomKind.pallet},
+        super(role: UnitRole.outboundGenerator, pos: const (row: -1, col: -1));
 
   /// Where spawned outbound trucks appear on the yard.
   final GridPos truckSpawn;
 
+  /// Seeded — demand LOOKS random but a run replays exactly (JEPA eval).
+  final SimRng rng;
+
+  /// UOMs this floor can actually serve: a picker handles it AND a rack type
+  /// supplies it. Minting outside this set creates a Job nobody can claim, which
+  /// claimableFor hides from the failure watchdog → the Order pins open forever.
+  final Set<UomKind> servableUoms;
+
   /// Max simultaneously-open outbound Orders.
   final int wipCap;
-  final int orderUnits;
+
+  /// Demand arrives on a jittered interval rather than every tick.
+  final int emitEveryTicks;
+  final int emitJitterTicks;
+
+  /// Max native units (pallets / cases / handfuls) per line.
+  final int maxUnitsPerLine;
 
   int _seq = 0;
+  int _nextEmitAtTick = 0;
 
   @override
   void perceiveAndDecide(BrainContext ctx) {
@@ -41,32 +71,73 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
         .length;
     if (openOutbound >= wipCap) return;
 
-    final stocked = _firstStocked(ctx.config);
-    if (stocked == null) return;
-    final sku = stocked.sku;
+    // Demand arrives on a jittered interval — not every single tick.
+    if (ctx.tick < _nextEmitAtTick) return;
 
-    // One UOM-unit per order for now: the pipeline mints exactly one pick Job and
-    // ships one unit, so the order must be sized to what a single pick→ship cycle
-    // delivers — a loose rack ships 1 loose, a case rack 4, a pallet rack 48
-    // (all in loose-equivalent). Larger multi-unit orders would wedge the WIP
-    // slot until multi-unit explosion is wired (AC-6).
-    final units = stocked.uom.looseUnits;
+    // Sample a SKU that is actually stocked in a SERVABLE rack type. Demand for a
+    // SKU nothing can supply would mint an unpickable Job and pin the Order open;
+    // the inbound loop is still driven, because shipping depletes these racks and
+    // the StockMonitor reorders them.
+    final byUom = _stockedByUom(ctx.config);
+    if (byUom.isEmpty) return;
+    final skus = byUom.keys.toList()..sort(); // deterministic candidate order
+    final sku = rng.pick(skus);
+    final available = byUom[sku]!.toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
+    if (available.isEmpty) return;
 
-    final order = board.mintOrder(
+    // Explode into ONE LINE PER UOM — this is "route as pallet, case, loose".
+    // Each line is claimed by the picker handling that UOM, so all three work the
+    // same order concurrently and it groups at the shipping area.
+    final lines = <OrderLine>[];
+    for (final uom in available) {
+      // Every servable UOM is a candidate; a coin-flip keeps order shapes varied,
+      // and the fallback below guarantees at least one line.
+      if (lines.isNotEmpty && !rng.chance(0.5)) continue;
+      final nativeUnits = rng.nextIntIn(1, maxUnitsPerLine);
+      lines.add(OrderLine(
+        lineId: 'L${lines.length}',
+        skuId: sku,
+        uom: uom,
+        units: nativeUnits * uom.looseUnits,
+      ));
+    }
+    if (lines.isEmpty) {
+      final uom = rng.pick(available);
+      lines.add(OrderLine(
+        lineId: 'L0',
+        skuId: sku,
+        uom: uom,
+        units: rng.nextIntIn(1, maxUnitsPerLine) * uom.looseUnits,
+      ));
+    }
+
+    final order = board.mintOrderOf(
       kind: OrderKind.outboundShip,
-      skuId: sku,
-      orderedUnits: units,
       nowTick: ctx.tick,
+      lines: lines,
     );
-    board.mintJobOf(
-      kind: JobKind.pickToStage,
-      requiredRole: UnitRole.pickRobot,
-      skuId: sku,
-      requiredUom: stocked.uom,
-      orderId: order.id,
-      idemKey: '${order.id}:L0:0',
-      qtyUnits: units,
-    );
+
+    // One Job PER NATIVE UNIT: a robot carries one pallet/case/handful per trip,
+    // so a 3-pallet line is 3 Jobs. Minting one fat Job instead would let a single
+    // trip settle it after moving one unit, wedging the Order at 48/144 forever.
+    for (final line in lines) {
+      final perTrip = line.uom.looseUnits;
+      final trips = (line.units / perTrip).ceil();
+      for (var k = 0; k < trips; k++) {
+        board.mintJobOf(
+          kind: JobKind.pickToStage,
+          requiredRole: UnitRole.pickRobot,
+          skuId: line.skuId,
+          requiredUom: line.uom,
+          orderId: order.id,
+          lineId: line.lineId,
+          idemKey: '${order.id}:${line.lineId}:$k',
+          qtyUnits: perTrip,
+        );
+      }
+    }
+
     ctx.ref.read(unitRegistryProvider.notifier).register(
           OutboundTruckBrain(
             id: 'OTRUCK-$id-${_seq++}',
@@ -74,6 +145,22 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
             orderId: order.id,
           ),
         );
+
+    _nextEmitAtTick = ctx.tick + rng.jitter(emitEveryTicks, emitJitterTicks);
+  }
+
+  /// SKU → the servable UOMs it currently has stock in.
+  Map<String, Set<UomKind>> _stockedByUom(WarehouseConfig cfg) {
+    final out = <String, Set<UomKind>>{};
+    for (final c in cfg.cells) {
+      if (!c.type.isRack || c.quantity <= 0) continue;
+      final sku = c.skuId;
+      if (sku == null || sku.isEmpty) continue;
+      final uom = rackUomOf(c.type);
+      if (uom == null || !servableUoms.contains(uom)) continue;
+      (out[sku] ??= <UomKind>{}).add(uom);
+    }
+    return out;
   }
 
   @override
@@ -81,18 +168,6 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
     lifecycle = UnitLifecycle.idle; // never moves
   }
 
-  /// First stocked rack of ANY type, with the UOM it holds. Real warehouses are
-  /// painted with `rackLoose` (the creator default); scanning only `rackPallet`
-  /// was why the whole outbound half stayed idle on a normal warehouse.
-  ({String sku, UomKind uom})? _firstStocked(WarehouseConfig cfg) {
-    for (final c in cfg.cells) {
-      if (!c.type.isRack) continue;
-      if (c.skuId == null || c.skuId!.isEmpty || c.quantity <= 0) continue;
-      final uom = rackUomOf(c.type);
-      if (uom != null) return (sku: c.skuId!, uom: uom);
-    }
-    return null;
-  }
 }
 
 /// The UOM a rack of [t] holds, or null if [t] is not a rack type. Shared by the

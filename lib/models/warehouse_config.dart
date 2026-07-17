@@ -308,10 +308,19 @@ class WarehouseCell {
   /// True when the rack is at full capacity.
   bool get isFull => quantity >= maxQuantity;
 
+  /// Face capacity, in the SAME native units the putaway drop uses.
+  ///
+  /// A pallet breaks into 12 cases (kCasesPerPallet) or 48 loose (kLoosePerPallet),
+  /// so a case/loose face must be able to absorb at least one broken pallet plus
+  /// headroom. The old values (2 and 2) made `PutawayRobotBrain._belowThreshold`
+  /// (which requires `room >= need`) unsatisfiable: 2 < 12 < 48, so EVERY pallet
+  /// fell through to "park the whole pallet in a pallet rack" and the case/loose
+  /// pick areas were never stocked — the whole case/loose pick flow was dead.
+  /// (Literals, not the job_board constants: job_board imports this file.)
   static int _defaultMaxQty(CellType t) {
-    if (t == CellType.rackPallet) return 5;
-    if (t == CellType.rackCase)   return 2;
-    if (t == CellType.rackLoose)  return 2;
+    if (t == CellType.rackPallet) return 5;   // pallets
+    if (t == CellType.rackCase)   return 24;  // cases = 2 broken pallets
+    if (t == CellType.rackLoose)  return 96;  // loose = 2 broken pallets
     return 0;
   }
 
@@ -327,6 +336,16 @@ class WarehouseCell {
 
   factory WarehouseCell.fromJson(Map<String, dynamic> j) {
     final t = CellType.values[j['t'] as int];
+    var mq = j['mq'] as int? ?? _defaultMaxQty(t);
+    // Heal layouts authored when case/loose faces held only 2 units — too small to
+    // absorb a broken pallet (12 cases / 48 loose), which silently made those pick
+    // areas unstockable and killed the case/loose pick flow. Raise an undersized
+    // face to the native-unit default so existing warehouses run the full loop.
+    // (Only ever raises, never shrinks a deliberately large face.)
+    if ((t == CellType.rackCase || t == CellType.rackLoose) &&
+        mq < _defaultMaxQty(t)) {
+      mq = _defaultMaxQty(t);
+    }
     return WarehouseCell(
       row:         j['r']  as int,
       col:         j['c']  as int,
@@ -336,7 +355,7 @@ class WarehouseCell {
       destId:      j['di'] as String?,
       skuId:       j['si'] as String?,
       quantity:    j['q']  as int? ?? 0,
-      maxQuantity: j['mq'] as int? ?? _defaultMaxQty(t),
+      maxQuantity: mq,
     );
   }
 
