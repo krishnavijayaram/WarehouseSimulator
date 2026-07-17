@@ -31,7 +31,15 @@ typedef SpawnedRobot = ({String id, int row, int col});
 /// One seat in the robot cast. Each `pick` seat is assigned a UOM at bootstrap
 /// from the UOMs the warehouse actually stocks — the Job's UOM gates who may
 /// claim it, so coverage matters (see the note in [bootstrapSimUnits]).
-enum _Slot { inbound, putaway, pick, outbound }
+enum _Slot { inbound, outbound, putaway, pick }
+
+/// Order dedicated picker seats fill UOMs in. Pallets come LAST on purpose: the
+/// three pallet-class robots (IR, OR, pallet-pick/putaway) already handle pallet
+/// work, so a scarce picker seat is better spent on cases and loose — nothing
+/// else can move those. This is what makes a 5-robot floor
+/// (IR + OR + PPR + case + loose) the working minimum, with a 6th robot adding
+/// the dedicated pallet picker.
+const _pickerUomPriority = [UomKind.caseUom, UomKind.loose, UomKind.pallet];
 
 /// Register the operational robot brains + the work-generating system brains for
 /// [config] and [robots]. Clears prior registry/resource state first (fresh sim).
@@ -60,21 +68,29 @@ void bootstrapSimUnits(
   // attempts counter can fire the watchdog — it would never be claimed, never
   // fail, and pin its Order open forever. Which UOMs actually exist here is fed
   // to the generator below so it can never mint a line nobody can pick.
+  // The cast, in fill order. The first three are the PALLET-CLASS robots — every
+  // one of them handles pallets, which is why 5 robots is the working minimum:
+  //   IR  inbound truck -> landing        OR   shipping -> outbound truck
+  //   PPR the spec-5 rule: pallet area / break->cases / break->loose /
+  //       cross-dock->outbound staging when an order is waiting
+  // then the dedicated pickers for the UOMs nothing else can move.
   const cast = <_Slot>[
     _Slot.inbound,
-    _Slot.putaway,
-    _Slot.pick,
-    _Slot.pick,
-    _Slot.pick,
     _Slot.outbound,
+    _Slot.putaway,
+    _Slot.pick, // case picker  ─┐ UOM chosen by _pickerUomPriority, so a
+    _Slot.pick, // loose picker ─┤ 5-robot floor gets case+loose and a 6th
+    _Slot.pick, // pallet picker ┘ robot adds the pallet picker.
   ];
   // Pickers specialise over the UOMs THIS warehouse actually stocks — not a fixed
-  // pallet/case/loose triple. A rackLoose-only floor with 4 robots would otherwise
-  // get a pallet picker and a case picker and NO loose picker, leaving every loose
-  // line unclaimable. Round-robin over the present UOMs guarantees that each one
-  // has a picker for any robot count >= the number of rack UOMs.
+  // pallet/case/loose triple. A rackLoose-only floor would otherwise get a pallet
+  // picker and a case picker with nothing to pick and NO loose picker, leaving
+  // every loose line unclaimable. Ordering by _pickerUomPriority spends scarce
+  // picker seats on cases/loose first, since pallets already have three robots.
   final rackUoms = _warehouseRackUoms(config).toList()
-    ..sort((a, b) => a.index.compareTo(b.index));
+    ..sort((a, b) => _pickerUomPriority
+        .indexOf(a)
+        .compareTo(_pickerUomPriority.indexOf(b)));
   if (rackUoms.isEmpty) rackUoms.add(UomKind.pallet);
 
   final pickerUoms = <UomKind>{};
