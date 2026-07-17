@@ -16,6 +16,7 @@ import '../../models/warehouse_config.dart';
 import '../../warehouse_engine/services/pathfinding.dart';
 import '../bay_resource.dart';
 import '../job_board.dart';
+import '../outbound_stage.dart';
 import 'action_applier.dart';
 import 'unit_brain.dart';
 
@@ -36,6 +37,18 @@ class PutawayRobotBrain extends UnitBrain {
   GridPos? _rack;
   int _dropAmount = 0; // in the destination rack's native unit
 
+  // ── Cross-dock (spec 5.1, the PRIMARY rule) ────────────────────────────────
+  // When the incoming pallet is already wanted by an open outbound order, it is
+  // driven straight to outbound staging instead of being put away. We hold the
+  // outbound pallet pick Job it replaces (so no picker races us), then complete
+  // it with no progress and mint the pack/load — exactly the accounting a normal
+  // rack-pick would produce, so a cross-docked pallet is never double-shipped.
+  bool _crossDock = false;
+  GridPos? _stageCell;
+  String? _heldPickJobId; // the outbound pick Job we hold + replace
+  String? _xdockOrderId;
+  String? _xdockLineId;
+
   List<GridPos> _path = const [];
   int _pathIdx = 0;
   int _ticksLeft = 0;
@@ -49,6 +62,10 @@ class PutawayRobotBrain extends UnitBrain {
     for (final job in board.claimableFor(UnitRole.putawayRobot)) {
       final src = job.src;
       if (src == null) continue;
+      // 5.1 CROSS-DOCK is the PRIMARY rule: if this incoming pallet is already
+      // wanted by an open outbound order, send it straight to shipping instead of
+      // putting it away. Try it before the 5.2–5.4 putaway rule.
+      if (_setupCrossDock(ctx, job, src)) return;
       // Decide the destination BEFORE claiming/draining staging (review DL-2,
       // F1-fsm): a capacity-aware 5.1–5.4 that won't over-fill. If no legal rack
       // exists, leave the pallet staged and the job unclaimed for a later retry.
@@ -88,6 +105,82 @@ class PutawayRobotBrain extends UnitBrain {
     }
   }
 
+  /// Try to route [job]'s incoming pallet straight to outbound staging. Returns
+  /// true (and arms the FSM) only if it fully committed: claimed the putaway Job,
+  /// is holding the outbound pick Job it replaces, and reserved a stage cell.
+  bool _setupCrossDock(BrainContext ctx, Job job, GridPos src) {
+    final board = ctx.board;
+    // An unclaimed pallet pick Job for this SKU IS the outstanding demand. Holding
+    // and later completing it (with no progress) replaces the rack pick 1:1, so
+    // the pallet is credited exactly once when it loads — never double-shipped.
+    final pick = _replaceablePickJob(ctx, job.skuId);
+    if (pick == null) return false;
+    final stage = _freeStage(ctx);
+    if (stage == null) return false;
+    final approach =
+        _adjacentWalkable(ctx.config, src.row, src.col, occupiedByOthers(ctx.ref, id));
+    final path = approach == null
+        ? const <GridPos>[]
+        : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
+    if (path.isEmpty) return false;
+
+    if (!board.claim(job.id, id)) return false;
+    // Hold the pick Job so no picker races us; back everything out if we can't.
+    if (!board.claim(pick.id, id)) {
+      board.release(job.id);
+      return false;
+    }
+    if (ctx.ref.read(stageReservationProvider.notifier).claimFirstFree([stage], id) ==
+        null) {
+      board.release(pick.id);
+      board.release(job.id);
+      return false;
+    }
+
+    _jobId = job.id;
+    currentJobId = job.id;
+    _sku = job.skuId;
+    _staging = src;
+    _crossDock = true;
+    _stageCell = stage;
+    _heldPickJobId = pick.id;
+    _xdockOrderId = pick.orderId;
+    _xdockLineId = pick.lineId;
+    _path = path;
+    _pathIdx = 0;
+    _state = _PR.toStaging;
+    lifecycle = UnitLifecycle.navigating;
+    board.markActive(job.id);
+    return true;
+  }
+
+  /// An unclaimed pallet-UOM pickToStage Job for [sku] whose Order is still live.
+  Job? _replaceablePickJob(BrainContext ctx, String sku) {
+    for (final j in ctx.board.claimableFor(UnitRole.pickRobot, uom: UomKind.pallet)) {
+      if (j.skuId != sku || j.orderId == null) continue;
+      final o = ctx.ref.read(jobBoardProvider).orders[j.orderId];
+      if (o != null &&
+          (o.status == OrderStatus.open || o.status == OrderStatus.fulfilling)) {
+        return j;
+      }
+    }
+    return null;
+  }
+
+  /// A free outbound-staging cell (same rule the pick robot stages into).
+  GridPos? _freeStage(BrainContext ctx) {
+    final held = ctx.ref.read(outboundStageProvider.notifier);
+    final reserved = ctx.ref.read(stageReservationProvider);
+    for (final c in ctx.config.cells) {
+      if (c.type == CellType.packStation &&
+          held.isFree(c.row, c.col) &&
+          !reserved.containsKey('${c.row}_${c.col}')) {
+        return (row: c.row, col: c.col);
+      }
+    }
+    return null;
+  }
+
   // ── Phase 2: run the FSM one step ──────────────────────────────────────────
 
   @override
@@ -106,15 +199,17 @@ class PutawayRobotBrain extends UnitBrain {
 
       case _PR.picking:
         if (--_ticksLeft <= 0) {
-          // Secure the path to the (pre-decided) rack BEFORE draining staging,
-          // so an abort never leaves the staged pallet destroyed (review DL-2).
+          // Secure the path to the destination (rack, or the cross-dock stage
+          // cell) BEFORE draining staging, so an abort never destroys the staged
+          // pallet (review DL-2).
+          final dest = _crossDock ? _stageCell! : _rack!;
           final approach = _adjacentWalkable(
-              ctx.config, _rack!.row, _rack!.col, occupiedByOthers(ctx.ref, id));
+              ctx.config, dest.row, dest.col, occupiedByOthers(ctx.ref, id));
           final path = approach == null
               ? const <GridPos>[]
               : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
           if (path.isEmpty) {
-            _abort(ctx); // rack now unreachable — staging still intact
+            _abort(ctx); // dest now unreachable — staging still intact
             return;
           }
           applier.pickFromStaging(this, _staging!, _sku);
@@ -133,6 +228,30 @@ class PutawayRobotBrain extends UnitBrain {
 
       case _PR.dropping:
         if (--_ticksLeft <= 0) {
+          if (_crossDock) {
+            // Drop the pallet into outbound staging and hand it to the pack/load
+            // unit exactly as a rack pick would. Completing the held pick Job with
+            // NO progress (progress lands at load) replaces it 1:1 — the pallet is
+            // credited to its line once, on the truck, never twice.
+            applier.stageOutbound(this, _stageCell!, _sku);
+            ctx.ref
+                .read(stageReservationProvider.notifier)
+                .release(_stageCell!.row, _stageCell!.col);
+            ctx.board.mintJobOf(
+              kind: JobKind.packAndLoad,
+              requiredRole: UnitRole.outboundRobot,
+              skuId: _sku,
+              orderId: _xdockOrderId,
+              lineId: _xdockLineId,
+              src: _stageCell,
+              qtyUnits: kLoosePerPallet,
+            );
+            ctx.board.completeJob(_heldPickJobId!); // replaced pick: no progress
+            ctx.board.completeJob(_jobId!); // putaway Job done
+            _reset();
+            lifecycle = UnitLifecycle.idle;
+            return;
+          }
           // Credit the Order by what the rack ACTUALLY absorbed, not a fixed
           // amount — no phantom over-credit if the cell clamped (review F2-fsm).
           final absorbed = applier.dropToRack(this, _rack!, _sku, _dropAmount);
@@ -185,26 +304,35 @@ class PutawayRobotBrain extends UnitBrain {
   }
 
   void _abort(BrainContext ctx) {
-    if (_rack != null) {
-      ctx.ref
-          .read(rackReservationProvider.notifier)
-          .release(_rack!.row, _rack!.col);
-    }
+    _releaseHeld(ctx);
     final id = _jobId;
     if (id != null) ctx.board.releaseOrFail(id);
     _reset();
     lifecycle = UnitLifecycle.idle;
   }
 
-  @override
-  void onReset(BrainContext ctx) {
-    // Release the held dest reservation so a revived cart isn't blocked by its
-    // own reservation (offline).
+  /// Give back every reservation/hold this cart is carrying. For a cross-dock
+  /// that means the held outbound pick Job goes back to the pool (a real picker
+  /// can serve it) and the stage cell is freed — nothing is stranded.
+  void _releaseHeld(BrainContext ctx) {
     if (_rack != null) {
       ctx.ref
           .read(rackReservationProvider.notifier)
           .release(_rack!.row, _rack!.col);
     }
+    if (_stageCell != null) {
+      ctx.ref
+          .read(stageReservationProvider.notifier)
+          .release(_stageCell!.row, _stageCell!.col);
+    }
+    if (_heldPickJobId != null) ctx.board.release(_heldPickJobId!);
+  }
+
+  @override
+  void onReset(BrainContext ctx) {
+    // Release every held reservation/job so a revived cart isn't blocked by its
+    // own reservation, and a cross-dock's held pick Job isn't stranded (offline).
+    _releaseHeld(ctx);
     _reset();
   }
 
@@ -216,6 +344,11 @@ class PutawayRobotBrain extends UnitBrain {
     _staging = null;
     _rack = null;
     _dropAmount = 0;
+    _crossDock = false;
+    _stageCell = null;
+    _heldPickJobId = null;
+    _xdockOrderId = null;
+    _xdockLineId = null;
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
