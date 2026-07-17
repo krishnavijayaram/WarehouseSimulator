@@ -26,8 +26,19 @@ class StockMonitorBrain extends UnitBrain {
   /// Where spawned trucks appear on the yard.
   final GridPos truckSpawn;
 
-  /// How much each replenishment Order requests (loose-equiv).
+  /// Legacy knob: a floor on how much a replenishment requests (loose-equiv).
+  /// Order size is now DERIVED from the truck manifest so the two can never
+  /// disagree — see the note at the mint site.
   final int reorderUnits;
+
+  /// Never send more than this many pallets in one truck.
+  static const int kMaxManifest = 4;
+
+  /// An inbound Order still open this long after minting is presumed dead (its
+  /// truck departed, or the pallets couldn't be absorbed) and is closed to re-arm
+  /// the trigger. Generous: a truck must spawn, drive, dock, unload and be put
+  /// away well inside this.
+  static const int kStaleOrderTicks = 600;
 
   int _truckSeq = 0;
 
@@ -51,10 +62,18 @@ class StockMonitorBrain extends UnitBrain {
       if (!seen.add(sku)) continue; // one decision per SKU per tick
       if (inFlight(sku)) continue;
 
+      // Send a truck sized to the ACTUAL deficit, and size the Order to exactly
+      // what that truck can deliver. These two MUST agree: one absorbed pallet
+      // credits kLoosePerPallet, so if orderedUnits exceeds manifest*48 the Order
+      // can never satisfy, and inFlight() below then blocks every future truck for
+      // this SKU forever. Today that only works by the accident of reorderUnits
+      // and one pallet's credit both being 48 — set reorderUnits to 96 and the
+      // SKU stalls permanently. Deriving both from one number removes the trap.
+      final pallets = _palletsNeeded(cfg, sku);
       final order = board.mintOrder(
         kind: OrderKind.inboundReplenish,
         skuId: sku,
-        orderedUnits: reorderUnits,
+        orderedUnits: pallets * kLoosePerPallet,
         nowTick: ctx.tick,
       );
       ctx.ref.read(unitRegistryProvider.notifier).register(
@@ -62,13 +81,14 @@ class StockMonitorBrain extends UnitBrain {
               id: 'TRUCK-$id-${_truckSeq++}',
               pos: truckSpawn,
               skuId: sku,
-              manifest: 1,
+              manifest: pallets,
               orderId: order.id, // thread orderId so putaway advances it (AC-2)
             ),
           );
     }
 
-    // 2) Close: replenish Orders whose SKU is back above reorder (delivered).
+    // 2) Close: replenish Orders whose SKU is back above reorder (delivered), or
+    //    that have gone stale.
     for (final o in orders) {
       if (o.kind != OrderKind.inboundReplenish) continue;
       if (o.status == OrderStatus.closed || o.status == OrderStatus.aborted) {
@@ -76,6 +96,13 @@ class StockMonitorBrain extends UnitBrain {
       }
       if (!_lowAnywhere(cfg, o.skuId)) {
         board.closeOrder(o.id); // through the notifier so watchers repaint (HT-6)
+      } else if (ctx.tick - o.createdTick > kStaleOrderTicks) {
+        // Still low long after its truck should have delivered — the truck died,
+        // or the pallets couldn't be absorbed. Close it to RE-ARM the trigger:
+        // otherwise inFlight() suppresses every future truck for this SKU and the
+        // replenish loop is dead for good. (Order.createdTick was written but read
+        // nowhere, so no age-based escape existed at all.)
+        board.closeOrder(o.id);
       }
     }
   }
@@ -83,6 +110,22 @@ class StockMonitorBrain extends UnitBrain {
   @override
   void act(BrainContext ctx) {
     lifecycle = UnitLifecycle.idle; // never moves
+  }
+
+  /// Pallets to send for [sku]: one per low face, bounded, and at least enough to
+  /// cover [reorderUnits]. The truck side has always been multi-pallet capable
+  /// (InboundTruckBrain loops the manifest minting one unload Job each) — nothing
+  /// ever passed more than 1, so every replenish was a whole spawn→drive→dock→
+  /// unload→depart cycle for a single pallet.
+  int _palletsNeeded(WarehouseConfig cfg, String sku) {
+    var lowFaces = 0;
+    for (final c in cfg.cells) {
+      if (c.type.isRack && c.skuId == sku && c.needsReplenishment) lowFaces++;
+    }
+    final floor = (reorderUnits / kLoosePerPallet).ceil();
+    var n = lowFaces > floor ? lowFaces : floor;
+    if (n < 1) n = 1;
+    return n > kMaxManifest ? kMaxManifest : n;
   }
 
   bool _lowAnywhere(WarehouseConfig cfg, String sku) {
