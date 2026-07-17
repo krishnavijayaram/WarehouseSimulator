@@ -17,6 +17,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../models/warehouse_config.dart';
 import '../bay_resource.dart';
 import '../job_board.dart';
+import '../outbound_stage.dart';
 import '../providers.dart';
 import 'unit_brain.dart';
 
@@ -66,7 +67,53 @@ class UnitScheduler {
       }
     }
 
+    // Phase 3a — reclaim goods stranded by a DEAD Order (review blocker: pack
+    // stations leak until outbound wedges). When an outbound Order aborts — a
+    // line that can't be served fails 8×, or its truck never wins a bay — its
+    // pickers may have ALREADY staged pallets and minted packAndLoad Jobs. Nothing
+    // else frees those: the pallet sits on its pack-station cell forever, and the
+    // Job orphans (dead Order → no shipBay → no OutboundRobot claims it, and an
+    // unclaimed Job is never swept). Left alone the stage cells leak one by one.
+    //
+    // So: any pick/pack Job whose Order is aborted or already gone gets its staged
+    // pallet cleared, its stage reservation released, and the Job failed. A live
+    // picker's claimed pickToStage isn't force-freed here — but the packAndLoad it
+    // ultimately mints for the dead Order is caught on a later pass, so the cell is
+    // always reclaimed in the end and the loop can't wedge.
+    _reclaimDeadOrderStage();
+
     // Phase 3 — sweep terminal work.
     ref.read(jobBoardProvider.notifier).sweepTerminal();
+  }
+
+  void _reclaimDeadOrderStage() {
+    final board = ref.read(jobBoardProvider.notifier);
+    final snapshot = ref.read(jobBoardProvider);
+    final stage = ref.read(outboundStageProvider.notifier);
+    final stageRes = ref.read(stageReservationProvider.notifier);
+    for (final job in snapshot.jobs.values) {
+      if (job.settled) continue;
+      if (job.kind != JobKind.packAndLoad && job.kind != JobKind.pickToStage) {
+        continue;
+      }
+      final oid = job.orderId;
+      if (oid == null) continue;
+      final order = snapshot.orders[oid];
+      final dead = order == null || order.status == OrderStatus.aborted;
+      if (!dead) continue;
+      // A claimed pickToStage is still being driven by a live picker — leave it;
+      // its eventual packAndLoad is reclaimed next pass. Only reclaim work that is
+      // parked (a staged pallet awaiting load, or an unclaimed pick).
+      if (job.kind == JobKind.pickToStage &&
+          job.status != JobStatus.unclaimed) {
+        continue;
+      }
+      final src = job.src;
+      if (src != null) {
+        stage.take(src.row, src.col); // free the physical pack-station cell
+        stageRes.release(src.row, src.col);
+      }
+      board.failJob(job.id);
+    }
   }
 }

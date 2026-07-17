@@ -48,6 +48,11 @@ class PutawayRobotBrain extends UnitBrain {
   String? _heldPickJobId; // the outbound pick Job we hold + replace
   String? _xdockOrderId;
   String? _xdockLineId;
+  // The INBOUND replenish Order this pallet's putaway Job belongs to. Cross-dock
+  // diverts the pallet to shipping instead of the rack, so replenishment did NOT
+  // happen — this Order must be aborted (not silently left open) or its SKU gets
+  // no new truck until the 600-tick stale timeout, and the rack stays empty.
+  String? _inboundOrderId;
 
   List<GridPos> _path = const [];
   int _pathIdx = 0;
@@ -146,6 +151,7 @@ class PutawayRobotBrain extends UnitBrain {
     _heldPickJobId = pick.id;
     _xdockOrderId = pick.orderId;
     _xdockLineId = pick.lineId;
+    _inboundOrderId = job.orderId; // the replenish Order this pallet came in on
     _path = path;
     _pathIdx = 0;
     _state = _PR.toStaging;
@@ -229,6 +235,21 @@ class PutawayRobotBrain extends UnitBrain {
       case _PR.dropping:
         if (--_ticksLeft <= 0) {
           if (_crossDock) {
+            // The outbound Order can have died while we drove here (its truck gave
+            // up on a bay, or a sibling line failed 8×). Staging into a dead Order
+            // would strand this pallet on the cell forever and orphan the load Job.
+            // If it's gone, fall back to a normal putaway of the carried pallet
+            // rather than dropping it into the void.
+            final outOrder = _xdockOrderId == null
+                ? null
+                : ctx.ref.read(jobBoardProvider).orders[_xdockOrderId];
+            final outLive = outOrder != null &&
+                (outOrder.status == OrderStatus.open ||
+                    outOrder.status == OrderStatus.fulfilling);
+            if (!outLive) {
+              _divertCrossDockToPutaway(ctx);
+              return;
+            }
             // Drop the pallet into outbound staging and hand it to the pack/load
             // unit exactly as a rack pick would. Completing the held pick Job with
             // NO progress (progress lands at load) replaces it 1:1 — the pallet is
@@ -248,6 +269,12 @@ class PutawayRobotBrain extends UnitBrain {
             );
             ctx.board.completeJob(_heldPickJobId!); // replaced pick: no progress
             ctx.board.completeJob(_jobId!); // putaway Job done
+            // The pallet went to shipping, not the rack: abort the replenish Order
+            // it arrived on so StockMonitor sends a fresh truck (rack still low)
+            // instead of suppressing that SKU until the stale timeout.
+            if (_inboundOrderId != null) {
+              ctx.board.closeOrder(_inboundOrderId!, aborted: true);
+            }
             _reset();
             lifecycle = UnitLifecycle.idle;
             return;
@@ -328,6 +355,57 @@ class PutawayRobotBrain extends UnitBrain {
     if (_heldPickJobId != null) ctx.board.release(_heldPickJobId!);
   }
 
+  /// The outbound Order died mid-cross-dock while we hold its pallet at the stage
+  /// cell. Put the pallet away in a rack instead — which legitimately replenishes,
+  /// so this cart's putaway Job (carrying the inbound Order) is credited normally
+  /// on drop. Give back the outbound hold + stage reservation first.
+  void _divertCrossDockToPutaway(BrainContext ctx) {
+    if (_heldPickJobId != null) ctx.board.failJob(_heldPickJobId!);
+    if (_stageCell != null) {
+      ctx.ref
+          .read(stageReservationProvider.notifier)
+          .release(_stageCell!.row, _stageCell!.col);
+    }
+    final applier = ActionApplier(ctx.ref, ctx.config);
+    void shed() {
+      // Nowhere to put it (rack full/unreachable AND order died) — drop the
+      // pallet and finish the Job so nothing wedges. Rare exceptional path.
+      applier.clearCargo(this);
+      ctx.board.completeJob(_jobId!);
+      _reset();
+      lifecycle = UnitLifecycle.idle;
+    }
+
+    final dest = _decideDestination(ctx.config, _sku);
+    if (dest == null) return shed();
+    final destCell = (row: dest.row, col: dest.col);
+    final rackRes = ctx.ref.read(rackReservationProvider.notifier);
+    if (rackRes.claimFirstFree([destCell], id) == null) return shed();
+    final approach = _adjacentWalkable(
+        ctx.config, destCell.row, destCell.col, occupiedByOthers(ctx.ref, id));
+    final path = approach == null
+        ? const <GridPos>[]
+        : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
+    if (path.isEmpty) {
+      rackRes.release(destCell.row, destCell.col);
+      return shed();
+    }
+    // Convert to a normal putaway to the rack. _jobId still carries the inbound
+    // Order in the board, so dropToRack + completeJob credits it correctly.
+    _crossDock = false;
+    _stageCell = null;
+    _heldPickJobId = null;
+    _xdockOrderId = null;
+    _xdockLineId = null;
+    _inboundOrderId = null;
+    _rack = destCell;
+    _dropAmount = dest.amount;
+    _path = path;
+    _pathIdx = 0;
+    _state = _PR.toRack;
+    lifecycle = UnitLifecycle.navigating;
+  }
+
   @override
   void onReset(BrainContext ctx) {
     // Release every held reservation/job so a revived cart isn't blocked by its
@@ -349,6 +427,7 @@ class PutawayRobotBrain extends UnitBrain {
     _heldPickJobId = null;
     _xdockOrderId = null;
     _xdockLineId = null;
+    _inboundOrderId = null;
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;

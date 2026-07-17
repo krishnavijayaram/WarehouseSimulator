@@ -156,10 +156,14 @@ class PickRobotBrain extends UnitBrain {
           } else {
             applier.pickFromTruck(this, _sku); // load-only, no rack decrement
           }
-          // Source-face contention is over now the stock is pulled.
+          // Source-face contention is over now the stock is pulled. Null _rack
+          // immediately: keeping it meant a later offline/onReset would release
+          // this cell a SECOND time — by then another unit may have reserved it,
+          // so the double-release frees someone else's reservation (review #4).
           ctx.ref
               .read(rackReservationProvider.notifier)
               .release(_rack!.row, _rack!.col);
+          _rack = null;
           _stage = stage;
           _path = path;
           _pathIdx = 0;

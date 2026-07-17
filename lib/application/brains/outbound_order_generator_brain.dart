@@ -91,9 +91,11 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
     // same order concurrently and it groups at the shipping area.
     final lines = <OrderLine>[];
     for (final uom in available) {
-      // Every servable UOM is a candidate; a coin-flip keeps order shapes varied,
-      // and the fallback below guarantees at least one line.
-      if (lines.isNotEmpty && !rng.chance(0.5)) continue;
+      // Coin-flip EVERY UOM (including the first) so order shapes really vary —
+      // the old `lines.isNotEmpty &&` guard made the lowest-index UOM appear in
+      // every order and left the fallback below dead (review #6). If all flips
+      // miss, the fallback guarantees at least one line.
+      if (!rng.chance(0.6)) continue;
       final nativeUnits = rng.nextIntIn(1, maxUnitsPerLine);
       lines.add(OrderLine(
         lineId: 'L${lines.length}',

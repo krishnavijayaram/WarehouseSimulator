@@ -49,7 +49,16 @@ void main() {
     final board = ref.read(jobBoardProvider.notifier);
     ref.read(warehouseConfigProvider.notifier).state = config;
 
-    // An inbound pallet has landed in staging, and there is a putaway Job for it.
+    // An inbound REPLENISH order + its pallet landed in staging, with a putaway
+    // Job carrying that order's id — exactly what the real inbound flow produces
+    // (the earlier version minted the Job with NO orderId, which masked the bug
+    // where cross-dock left the replenish order dangling open).
+    final inbound = board.mintOrder(
+      kind: OrderKind.inboundReplenish,
+      skuId: 'SKU1',
+      orderedUnits: kLoosePerPallet,
+      nowTick: 0,
+    );
     ref.read(stagingPalletsProvider.notifier).drop(0, 1, 'SKU1');
     ref
         .read(unitRegistryProvider.notifier)
@@ -58,6 +67,7 @@ void main() {
       kind: JobKind.putaway,
       requiredRole: UnitRole.putawayRobot,
       skuId: 'SKU1',
+      orderId: inbound.id,
       src: (row: 0, col: 1),
       qtyUnits: kLoosePerPallet,
     );
@@ -113,5 +123,17 @@ void main() {
     // The order line has NOT been over-credited: progress is still 0 until load.
     expect(ref.read(jobBoardProvider).orders[order.id]!.progressUnits, 0,
         reason: 'cross-dock credits progress at LOAD, exactly once — not twice');
+
+    // The inbound replenish order the pallet arrived on must NOT be left dangling
+    // open (that would suppress this SKU's next truck for 600 ticks). It is either
+    // aborted, or already swept — but never still open/fulfilling (review #1).
+    final inboundOrder = ref.read(jobBoardProvider).orders[inbound.id];
+    expect(
+        inboundOrder == null ||
+            inboundOrder.status == OrderStatus.aborted ||
+            inboundOrder.status == OrderStatus.closed,
+        isTrue,
+        reason:
+            'the diverted replenish order must be closed so replenishment re-triggers');
   });
 }
