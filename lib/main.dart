@@ -284,6 +284,13 @@ class _WoisAppState extends ConsumerState<WoisApp> {
       }
     }
     if (cfg == null) return;
+    // EX-safety: the config is loaded above so a non-owner can VIEW the warehouse
+    // statically, but only the owner session restores/writes ops state. This one
+    // gate stops all of the heavy backend work below for everyone else: the
+    // publishWarehouse reseed (a load amplifier that fires on transient DB errors),
+    // the 6-table observation seeds (manualRobotController.initialize), the scout
+    // sim, and the cargo fetch — none of which a static viewer needs.
+    if (!ref.read(isSimOwnerProvider)) return;
     if (ref.read(operationsStartedProvider)) return; // already running
 
     // ── 1. Ensure warehouse row exists in DB ───────────────────────────────

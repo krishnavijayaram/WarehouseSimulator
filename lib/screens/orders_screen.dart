@@ -97,6 +97,7 @@ class _InboundTabState extends ConsumerState<_InboundTab> {
   }
 
   Future<void> _load() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session polls only
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) return;
     try {
@@ -916,6 +917,7 @@ class _OutboundTabState extends ConsumerState<_OutboundTab> {
   }
 
   Future<void> _load() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session polls only
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) return;
     try {

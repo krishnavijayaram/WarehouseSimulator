@@ -227,12 +227,25 @@ Robot _mapApiRobot(Map<String, dynamic> r, WarehouseConfig config) {
   );
 }
 
-/// Polls live robot positions every 3 s.
+/// True only for the single account allowed to run the LIVE simulator + generate
+/// backend traffic; every other visitor gets a frozen static view. This is the
+/// EX-safety scope gate (one active session can't load the shared Postgres). It
+/// MUST be checked by every polling provider / write path — the earlier version
+/// lived only in floor_screen, so app-wide providers (live robots, inbound
+/// trucks, WMS dashboard, orders) bypassed it and polled for ALL users.
+final isSimOwnerProvider = Provider<bool>((ref) {
+  final auth = ref.watch(authProvider);
+  return auth is AuthLoggedIn && auth.user.isPrivileged;
+});
+
+/// Polls live robot positions every 3 s — OWNER SESSION ONLY.
 /// Rebuilds automatically when [warehouseConfigProvider] changes.
 final liveRobotsProvider =
     StreamProvider.autoDispose<List<Robot>>((ref) async* {
   final config = ref.watch(warehouseConfigProvider);
-  if (config == null) {
+  // EX-safety: non-owners never poll the shared backend — they see the static
+  // spawns/frame instead. Bounds all robot-position polling to one session.
+  if (config == null || !ref.watch(isSimOwnerProvider)) {
     yield const [];
     return;
   }
@@ -429,7 +442,9 @@ typedef InboundTruckData = ({
 final inboundTrucksProvider =
     StreamProvider.autoDispose<InboundTruckData>((ref) async* {
   final config = ref.watch(warehouseConfigProvider);
-  if (config == null) {
+  // EX-safety: owner session only — non-owners bypassed the floor_screen gate and
+  // hit yms/trucks + yms/inbound-shipments every 5s for ALL users.
+  if (config == null || !ref.watch(isSimOwnerProvider)) {
     yield (trucks: const [], shipmentsByTruck: const {});
     return;
   }

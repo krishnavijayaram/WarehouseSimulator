@@ -313,6 +313,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
 
   Future<void> _handleCellExplore(
       String warehouseId, int row, int col) async {
+    // EX-safety: exploreCell is a Reality->WMS read+write transaction — owner
+    // session only, so rapid tapping by any visitor can't burst writes.
+    if (!_isSimOwner) return;
     try {
       await ApiClient.instance.exploreCell(
         warehouseId: warehouseId,
@@ -1264,7 +1267,11 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
           ref.read(exploredCellsProvider.notifier).reset();
           ref.read(activeEventsProvider.notifier).resolveAll();
           ref.read(operationsStartedProvider.notifier).state = true;
-          ref.read(manualRobotControllerProvider.notifier).initialize(config);
+          // EX-safety: ManualRobotController seeds + posts 6-table observation
+          // WRITES per robot — owner session only.
+          if (_isSimOwner) {
+            ref.read(manualRobotControllerProvider.notifier).initialize(config);
+          }
 
           // Persist ops-started so fog survives page refresh.
           SharedPreferences.getInstance().then((prefs) {
@@ -1291,8 +1298,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
             _warnIfNotReady(config);
           }
 
+          // EX-safety: registerSimSession is a backend write — owner session only.
           final auth = ref.read(authProvider);
-          if (auth is AuthLoggedIn) {
+          if (auth is AuthLoggedIn && _isSimOwner) {
             _startSessionTimer(auth.session.effectiveSessionId, auth.user.email);
           }
         },

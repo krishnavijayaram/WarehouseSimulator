@@ -97,6 +97,7 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
   }
 
   Future<void> _fetchWarehouseStatus() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session only
     final status =
         await ApiClient.instance.getWarehouseStatus(widget.config.id);
     if (!mounted) return;
@@ -117,6 +118,7 @@ class _ScoutingPanelState extends ConsumerState<_ScoutingPanel> {
   }
 
   Future<void> _fetch() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session polls only
     try {
       final data = await ApiClient.instance.getWmsDashboard(widget.config.id);
       if (mounted) {

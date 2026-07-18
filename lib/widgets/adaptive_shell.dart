@@ -184,7 +184,11 @@ class _AdaptiveShellState extends ConsumerState<AdaptiveShell> {
     // first time liveRobots data arrives. This ensures cargo is never lost
     // after a page refresh — the backend is the source of truth.
     ref.listen<AsyncValue<List<Robot>>>(liveRobotsProvider, (_, next) {
-      if (!_cargoHydrated && next.valueOrNull?.isNotEmpty == true) {
+      // EX-safety: only the owner session fetches cargo from the backend. (Also
+      // implied now that liveRobotsProvider yields [] for non-owners, but explicit.)
+      if (!_cargoHydrated &&
+          ref.read(isSimOwnerProvider) &&
+          next.valueOrNull?.isNotEmpty == true) {
         _cargoHydrated = true;
         ref.read(robotCargoProvider.notifier).hydrateFromBackend();
       }
