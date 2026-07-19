@@ -64,6 +64,15 @@ List<ReadinessIssue> checkWarehouseReadiness(WarehouseConfig cfg) {
     issues.add(ReadinessIssue(ReadinessSeverity.warning,
         'Only $spawnCount robot spawn(s) — roles round-robin inbound→putaway→pick→outbound, so with fewer than 4 a branch is unstaffed. Add up to 4.'));
   }
+  // An outbound order routes into up to THREE lines (pallet + case + loose), and
+  // each staged item occupies one pack-station cell until it is loaded. With a
+  // single cell an order can never be consolidated, and picking backs up behind
+  // the one slot — measured in the E2E probe as the throughput ceiling.
+  final packCount = cfg.cells.where((c) => c.type == CellType.packStation).length;
+  if (packCount == 1) {
+    issues.add(const ReadinessIssue(ReadinessSeverity.warning,
+        'Only one pack station — an order\'s pallet/case/loose lines cannot be staged together, and picking stalls behind the single slot. Add 2–3 for a smooth flow.'));
+  }
   if (!hasStaging) {
     issues.add(const ReadinessIssue(ReadinessSeverity.warning,
         'No pallet staging — inbound unload/putaway has nowhere to drop pallets, so the inbound branch stalls.'));

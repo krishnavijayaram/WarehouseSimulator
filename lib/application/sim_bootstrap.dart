@@ -74,13 +74,23 @@ void bootstrapSimUnits(
   //   PPR the spec-5 rule: pallet area / break->cases / break->loose /
   //       cross-dock->outbound staging when an order is waiting
   // then the dedicated pickers for the UOMs nothing else can move.
+  // Fill order matters. Each pick trip stages ONE item that then needs ONE load
+  // trip, so pickers and outbound loaders must be roughly 1:1. The old order gave
+  // 3 pickers to 1 loader at six robots: the E2E probe showed stage cells filling
+  // faster than the single loader could drain them (staging events doubled while
+  // ships did not rise), with pickers backing up behind full cells.
+  //   5 robots -> IR, OR, PPR, case-picker, loose-picker   (the agreed minimum)
+  //   6 robots -> + a SECOND loader, giving 2 pickers : 2 loaders
+  //   7+       -> pallet picker, then further loaders, staying ~balanced
   const cast = <_Slot>[
     _Slot.inbound,
     _Slot.outbound,
     _Slot.putaway,
-    _Slot.pick, // case picker  ─┐ UOM chosen by _pickerUomPriority, so a
-    _Slot.pick, // loose picker ─┤ 5-robot floor gets case+loose and a 6th
-    _Slot.pick, // pallet picker ┘ robot adds the pallet picker.
+    _Slot.pick, // case picker  ─┐ UOM chosen by _pickerUomPriority
+    _Slot.pick, // loose picker ─┘
+    _Slot.outbound, // 2nd loader — keeps loaders in step with pickers
+    _Slot.pick, // pallet picker
+    _Slot.outbound,
   ];
   // Pickers specialise over the UOMs THIS warehouse actually stocks — not a fixed
   // pallet/case/loose triple. A rackLoose-only floor would otherwise get a pallet

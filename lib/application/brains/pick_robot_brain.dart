@@ -72,6 +72,13 @@ class PickRobotBrain extends UnitBrain {
   void perceiveAndDecide(BrainContext ctx) {
     if (_state != _PK.idle) return;
     final board = ctx.board;
+    // NOTE (measured, do not "fix" naively): gating picks on a docked truck
+    // (order.shipBay != null) raises pick->load conversion from 37% to 71% but
+    // COLLAPSES throughput (ships 6 -> 3), because picking then only happens
+    // inside the truck's short dwell window. Shortening the dwell made it worse
+    // still (ships -> 2). The real fix is the grouping/close-at-departure design
+    // — pick while the truck approaches, and let it wait for its group — not a
+    // claim-time gate or a dwell knob.
     for (final job in board.claimableFor(UnitRole.pickRobot, uom: handledUom)) {
       if (!board.claim(job.id, id)) continue;
       final src = _findSource(

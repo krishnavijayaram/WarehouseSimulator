@@ -44,7 +44,9 @@ class OutboundTruckBrain extends UnitBrain {
   static const int kMaxSeekTicks = 120;
 
   /// Never hold a bay forever: if the floor stops delivering, leave with what we
-  /// have so the next truck can dock.
+  /// have so the next truck can dock. 500 measured best — shortening it to 120
+  /// made trucks leave before their orders were picked and ships FELL (6 -> 2),
+  /// so this is a deliberate value, not a default.
   static const int kMaxDwellTicks = 500;
 
   _OT _state = _OT.seekingBay;

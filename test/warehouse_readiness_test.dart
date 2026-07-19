@@ -32,7 +32,11 @@ void main() {
             skuId: 'SKU1',
             quantity: 8,
             maxQuantity: 10),
+        // Three pack stations: an order routes into up to three UOM lines, so a
+        // single stage cell can neither group an order nor keep picking flowing.
+        WarehouseCell(row: 0, col: 6, type: CellType.packStation),
         WarehouseCell(row: 0, col: 7, type: CellType.packStation),
+        WarehouseCell(row: 0, col: 8, type: CellType.packStation),
         WarehouseCell(row: 0, col: 9, type: CellType.outbound),
       ],
       spawns: const [
