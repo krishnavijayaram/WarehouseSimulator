@@ -339,7 +339,7 @@ class _WoisAppState extends ConsumerState<WoisApp> {
         for (final cell in cells) {
           exploredN.markExplored(cell[0], cell[1]);
         }
-        ref.read(simulationModeProvider.notifier).state = 'manual';
+        ref.read(simulationModeProvider.notifier).state = 'automated';
         ref.read(operationsStartedProvider.notifier).state = true;
         ref.read(manualRobotControllerProvider.notifier).initialize(cfg);
         _restartScoutSim(cfg);
@@ -382,7 +382,7 @@ class _WoisAppState extends ConsumerState<WoisApp> {
       }
     }
 
-    ref.read(simulationModeProvider.notifier).state = 'manual';
+    ref.read(simulationModeProvider.notifier).state = 'automated';
     ref.read(operationsStartedProvider.notifier).state = true;
     ref.read(manualRobotControllerProvider.notifier).initialize(cfg);
     _restartScoutSim(cfg);
@@ -422,8 +422,15 @@ class _WoisAppState extends ConsumerState<WoisApp> {
       isSaboteur: false,
     );
     ref.read(scoutSimulationProvider.notifier).state = scout;
-    // Manual mode: never create the step timer — robots only move via STEP.
-    scout.startManual();
+    // Respect the mode. This was HARDCODED to startManual(), so a restored session
+    // (page refresh / re-login) never created the tick loop — the autonomous
+    // brains never ran and robots only moved via STEP, even in automated mode.
+    // That is the "warehouse restores but no robot moves" symptom on refresh.
+    if (ref.read(simulationModeProvider) == 'manual') {
+      scout.startManual();
+    } else {
+      scout.start();
+    }
   }
 
   ThemeData _buildTheme() {

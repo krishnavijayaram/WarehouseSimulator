@@ -3527,7 +3527,14 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                     style: TextStyle(
                         fontWeight: FontWeight.bold, letterSpacing: 1.2)),
                 onPressed: () {
-                  ref.read(simulationModeProvider.notifier).state = 'manual';
+                  // AUTOMATED, not manual: this desktop DASH Start-Operations is
+                  // the view most users actually run, and setting 'manual' here
+                  // meant _launchSimulation called scout.startManual() — no tick
+                  // timer, so the autonomous brains never ran and robots only
+                  // moved via the D-pad. That is the "warehouse auto-reveals but
+                  // no robot moves" symptom. Automated mode starts the tick loop;
+                  // the D-pad still works on top for manual inbound overrides.
+                  ref.read(simulationModeProvider.notifier).state = 'automated';
                   ref.read(exploredCellsProvider.notifier).reset();
                   ref.read(activeEventsProvider.notifier).resolveAll();
                   ref.read(blockedCellsProvider.notifier).reset();
@@ -3550,9 +3557,9 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   });
                   // Seed the blocked-cells overlay from the backend.
                   ref.read(blockedCellsProvider.notifier).refresh(config.id);
-                  // Create the simulation (needed for the STEP button and
-                  // the 30-second backend flush) but keep it paused so bots
-                  // only move when the user presses STEP.
+                  // Start the autonomous simulation: in automated mode this
+                  // creates the 400ms tick loop that runs the brains, so robots
+                  // move on their own (STEP still works too).
                   _launchSimulation(config);
                 },
               ),

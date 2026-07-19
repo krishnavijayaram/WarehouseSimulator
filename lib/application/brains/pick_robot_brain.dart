@@ -111,8 +111,12 @@ class PickRobotBrain extends UnitBrain {
         if (src == null &&
             (_hasAnyStock(ctx.config, job.skuId) ||
                 _replenishInFlight(ctx, job.skuId))) {
+          diag('PICK.decide.transientWait');
           board.release(job.id);
         } else {
+          diag(src == null
+              ? 'PICK.decide.FAIL.noSource'
+              : 'PICK.decide.FAIL.noPathToRack');
           board.releaseOrFail(job.id);
         }
         continue;
@@ -165,6 +169,9 @@ class PickRobotBrain extends UnitBrain {
               ? const <GridPos>[]
               : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
           if (stage == null || path.isEmpty) {
+            diag(stage == null
+                ? 'PICK.stage.FAIL.noFreeStage'
+                : 'PICK.stage.FAIL.noPathToStage');
             _abort(ctx); // nothing picked/consumed yet — no orphaned stock
             return;
           }

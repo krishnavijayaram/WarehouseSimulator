@@ -129,6 +129,7 @@ class UnitScheduler {
           job.status != JobStatus.unclaimed) {
         continue;
       }
+      diag('RECLAIM.deadOrderStage.${job.kind.name}');
       final src = job.src;
       if (src != null) {
         stage.take(src.row, src.col); // free the physical pack-station cell

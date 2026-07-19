@@ -45,12 +45,23 @@ class OutboundRobotBrain extends UnitBrain {
     if (_state != _OR.idle) return;
     final board = ctx.board;
     final orders = ctx.ref.read(jobBoardProvider).orders;
-    for (final job in board.claimableFor(UnitRole.outboundRobot)) {
+    final claimable = board.claimableFor(UnitRole.outboundRobot);
+    if (claimable.isEmpty) {
+      diag('LOAD.idle.noPackLoadJobs');
+    } else {
+      final anyDocked = claimable.any((j) {
+        final o = j.orderId == null ? null : orders[j.orderId];
+        return j.src != null && o?.shipBay != null;
+      });
+      diag(anyDocked ? 'LOAD.workAvailable.docked' : 'LOAD.idle.jobsButNoDock');
+    }
+    for (final job in claimable) {
       final stage = job.src;
       final order = job.orderId == null ? null : orders[job.orderId];
       final shipBay = order?.shipBay;
       if (stage == null || shipBay == null) continue; // truck not docked yet
       if (!board.claim(job.id, id)) continue;
+      diag('LOAD.claimed');
 
       final approach = _adjacentWalkable(
           ctx.config, stage.row, stage.col, occupiedByOthers(ctx.ref, id));
@@ -85,6 +96,7 @@ class OutboundRobotBrain extends UnitBrain {
         lifecycle = UnitLifecycle.idle;
 
       case _OR.toStage:
+        diag('LOAD.tick.toStage');
         if (_advance(applier)) {
           _state = _OR.picking;
           _ticksLeft = kPickTicks;
@@ -118,6 +130,7 @@ class OutboundRobotBrain extends UnitBrain {
         }
 
       case _OR.toTruck:
+        diag('LOAD.tick.toTruck');
         if (_advance(applier)) {
           _state = _OR.loading;
           _ticksLeft = kLoadTicks;
@@ -127,6 +140,8 @@ class OutboundRobotBrain extends UnitBrain {
       case _OR.loading:
         if (--_ticksLeft <= 0) {
           applier.loadOntoTruck(this);
+          diag('LOAD.completed');
+          diag('LOAD.completed.units', _units);
           // The one increment on the Order (LCC-2): credit the actual loose-equiv
           // shipped, from the Job — not a hardcoded pallet (review AC-5).
           ctx.board.completeJob(_jobId!, progressUnits: _units);

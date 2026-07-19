@@ -113,6 +113,7 @@ class OutboundTruckBrain extends UnitBrain {
         if (++_seekTicks > kMaxSeekTicks) {
           // Couldn't get a bay in time → abort what we carry so the generator's
           // WIP slots free instead of the outbound loop wedging (review HT-2).
+          diag('TRUCK.seekTimeout.orders.${_orders.length}');
           for (final oid in _orders) {
             ctx.board.closeOrder(oid, aborted: true);
           }
@@ -144,6 +145,26 @@ class OutboundTruckBrain extends UnitBrain {
         // too long — the timeout is what stops a half-full truck holding the bay
         // forever and starving every following order.
         if (!stillLoading || _dwellTicks > kMaxDwellTicks) {
+          // DIAGNOSTIC: classify why the truck departs and how many orders
+          // aboard were NOT satisfied when it left.
+          final unsat = _orders.where((oid) {
+            final o = boardOrders[oid];
+            return o != null && !o.isSatisfied && o.status != OrderStatus.aborted;
+          }).length;
+          final satcount = _orders.where((oid) {
+            final o = boardOrders[oid];
+            return o != null && o.isSatisfied;
+          }).length;
+          if (_dwellTicks > kMaxDwellTicks) {
+            diag('TRUCK.dwellTimeout');
+            diag('TRUCK.dwellTimeout.unsatOrdersAboard', unsat);
+            diag('TRUCK.dwellTimeout.satOrdersAboard', satcount);
+          } else {
+            diag('TRUCK.departComplete');
+            diag('TRUCK.departComplete.satOrdersAboard', satcount);
+            diag('TRUCK.departComplete.unsatOrdersAboard', unsat);
+          }
+          diag('TRUCK.depart.ordersAboard', _orders.length);
           for (final oid in _orders) {
             ctx.board.setShipBay(oid, null); // clear the handoff (HT-5/HT-6)
           }

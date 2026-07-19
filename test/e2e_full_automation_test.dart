@@ -132,12 +132,17 @@ void main() {
     final vanished = <String>{}; // swept => the cycle ended (shipped or aborted)
     final shippedSome = <String>{}; // vanished with progress > 0 => really shipped
     final lastProgress = <String, int>{};
+    final orderedUnitsSeen = <String, int>{};
     final jobsByKind = <JobKind, Set<String>>{};
     final linesByUom = <UomKind, int>{};
     final inboundTrucks = <String>{};
     final outboundTrucks = <String>{};
     var maxStaged = 0;
     var stagedEvents = 0;
+    var fullBufferTicks = 0;
+    var fullBufferWithStuckTicks = 0;
+    var anyTruckDockedTicks = 0; // ticks >=1 outbound order has shipBay!=null
+    var loaderBusyTicks = 0; // ticks >=1 outbound robot has a current job
     final movedRobots = <String>{};
     const spawns = {
       'IR-1': '1_0', 'OR-1': '1_1', 'PPR-1': '1_2',
@@ -186,6 +191,7 @@ void main() {
           }
         }
         lastProgress[o.id] = o.progressUnits;
+        orderedUnitsSeen[o.id] = o.orderedUnits;
         if (o.status == OrderStatus.closed) ordersClosed.add(o.id);
         if (o.status == OrderStatus.aborted) ordersAborted.add(o.id);
       }
@@ -199,6 +205,41 @@ void main() {
       final staged = ref.read(outboundStageProvider).length;
       if (staged > maxStaged) maxStaged = staged;
       if (staged > 0) stagedEvents++;
+      if (board.orders.values
+          .any((o) => o.kind == OrderKind.outboundShip && o.shipBay != null)) {
+        anyTruckDockedTicks++;
+      }
+      if (ref.read(unitRegistryProvider).values.any(
+          (u) => u.role == UnitRole.outboundRobot && u.currentJobId != null)) {
+        loaderBusyTicks++;
+      }
+      // BUFFER COMPOSITION: when the buffer is FULL (all 3 pack stations taken),
+      // classify each occupied cell as drainable (a packAndLoad job exists for it
+      // whose order has a docked truck, shipBay!=null) or STUCK (no such job /
+      // order has shipBay==null → an outbound robot can never claim it).
+      if (staged >= 3) {
+        fullBufferTicks++;
+        final stageMap = ref.read(outboundStageProvider);
+        final jobs = board.jobs.values
+            .where((j) => j.kind == JobKind.packAndLoad)
+            .toList();
+        var anyStuck = false;
+        for (final key in stageMap.keys) {
+          final parts = key.split('_');
+          final r = int.parse(parts[0]);
+          final c = int.parse(parts[1]);
+          Job? pl;
+          for (final j in jobs) {
+            if (j.src != null && j.src!.row == r && j.src!.col == c) {
+              pl = j;
+              break;
+            }
+          }
+          final ord = pl?.orderId == null ? null : board.orders[pl!.orderId];
+          if (pl == null || ord == null || ord.shipBay == null) anyStuck = true;
+        }
+        if (anyStuck) fullBufferWithStuckTicks++;
+      }
       final pos = ref.read(manualRobotPositionsProvider);
       spawns.forEach((id, home) {
         final p = pos[id];
@@ -237,6 +278,52 @@ void main() {
         'cleared=${clearedBlockers.length} stillBlocked=${ref.read(blockedCellsProvider)}');
     debugPrint('RECOVERY    : pos=${rc?.pos} job=${rc?.currentJobId} '
         'life=${rc?.lifecycle.name} liveClearJobs=$stuckJobs');
+    debugPrint('=================================================');
+    debugPrint('----- LIFECYCLE DIAG -----');
+    final keys = kDiag.keys.toList()..sort();
+    for (final k in keys) {
+      debugPrint('  $k = ${kDiag[k]}');
+    }
+    // Per-order: did the ones we saw ever reach full progress?
+    var fullyShipped = 0, partial = 0, zero = 0;
+    lastProgress.forEach((id, prog) {
+      final ordered = orderedUnitsSeen[id] ?? -1;
+      if (prog <= 0) {
+        zero++;
+      } else if (ordered > 0 && prog >= ordered) {
+        fullyShipped++;
+      } else {
+        partial++;
+      }
+    });
+    debugPrint('ORDERS by final progress: fully=$fullyShipped '
+        'partial=$partial zero=$zero (ordered map size=${orderedUnitsSeen.length})');
+    // End-of-run OUTBOUND order autopsy: what state are the survivors in, and
+    // are pack stations clogged with un-loadable staged goods?
+    final endBoard = ref.read(jobBoardProvider);
+    var obOpenNoBay = 0, obOpenWithBay = 0, obFulfilling = 0, obStagedStuck = 0;
+    for (final o in endBoard.orders.values) {
+      if (o.kind != OrderKind.outboundShip) continue;
+      if (o.status == OrderStatus.open || o.status == OrderStatus.fulfilling) {
+        if (o.shipBay == null) obOpenNoBay++; else obOpenWithBay++;
+        if (o.status == OrderStatus.fulfilling) obFulfilling++;
+        if (o.stagedUnits > 0) obStagedStuck++;
+      }
+    }
+    final endStage = ref.read(outboundStageProvider);
+    final unclaimedPackLoad = endBoard.jobs.values
+        .where((j) => j.kind == JobKind.packAndLoad &&
+            j.status == JobStatus.unclaimed)
+        .length;
+    debugPrint('OUTBOUND SURVIVORS: openNoBay=$obOpenNoBay openWithBay=$obOpenWithBay '
+        'fulfilling=$obFulfilling withStagedUnits=$obStagedStuck');
+    debugPrint('DOCK/LOADER TICKS: anyOutboundDocked=$anyTruckDockedTicks/$horizon '
+        'loaderBusy=$loaderBusyTicks/$horizon');
+    debugPrint('BUFFER FULL TICKS: full=$fullBufferTicks '
+        'ofWhichHaveStuckCell=$fullBufferWithStuckTicks '
+        '(${horizon > 0 ? (100 * fullBufferWithStuckTicks / (fullBufferTicks == 0 ? 1 : fullBufferTicks)).toStringAsFixed(0) : 0}% of full-buffer ticks blocked by an un-drainable cell)');
+    debugPrint('END STAGE OCCUPANCY: cells=${endStage.length} $endStage '
+        'unclaimedPackLoadJobs=$unclaimedPackLoad');
     debugPrint('=================================================\n');
 
     // The anomaly loop must work INSIDE the running warehouse, not just in
