@@ -337,10 +337,6 @@ class JobBoardState {
       JobBoardState(orders: {}, jobs: {}, consumedIdemKeys: {});
 }
 
-/// TEMP DIAGNOSTIC COUNTERS (remove after analysis).
-final Map<String, int> kDiag = <String, int>{};
-void diag(String k, [int n = 1]) => kDiag[k] = (kDiag[k] ?? 0) + n;
-
 class JobBoardNotifier extends StateNotifier<JobBoardState> {
   JobBoardNotifier() : super(JobBoardState.empty);
 
@@ -472,17 +468,14 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
     final j = state.jobs[jobId];
     if (j == null || j.settled) return;
     j.attempts++;
-    diag('releaseOrFail.attempt.${j.kind.name}');
     if (j.attempts >= kMaxJobAttempts) {
       j.status = JobStatus.failed;
       j.settled = true;
-      diag('JOBFAILED.maxAttempts.${j.kind.name}');
       final o = j.orderId == null ? null : state.orders[j.orderId];
       if (o != null &&
           o.status != OrderStatus.closed &&
           o.status != OrderStatus.aborted) {
         o.status = OrderStatus.aborted;
-        diag('ORDERDEATH.jobMaxAttempts.${j.kind.name}');
       }
     } else {
       j.status = JobStatus.unclaimed;
@@ -517,15 +510,11 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
       // loose picker all serving one order each credit their own line instead of
       // racing a single shared counter.
       order.advanceProgress(progressUnits, lineId: j.lineId);
-      diag('progressCredited.${j.kind.name}', progressUnits);
       // `fulfilling` was declared and read but never assigned anywhere.
       if (order.status == OrderStatus.open) {
         order.status = OrderStatus.fulfilling;
       }
-      if (order.isSatisfied) {
-        order.status = OrderStatus.closed;
-        diag('ORDERCLOSED.satisfied.${order.kind.name}');
-      }
+      if (order.isSatisfied) order.status = OrderStatus.closed;
     }
     _touch();
   }
@@ -544,7 +533,6 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
     final o = state.orders[orderId];
     if (o == null || o.status == OrderStatus.closed) return;
     o.status = aborted ? OrderStatus.aborted : OrderStatus.closed;
-    diag('closeOrder.${aborted ? "aborted" : "closed"}');
     _touch();
   }
 

@@ -61,6 +61,11 @@ WarehouseConfig _fullWarehouse() => WarehouseConfig(
         WarehouseCell(row: 0, col: 4, type: CellType.packStation),
         WarehouseCell(row: 0, col: 5, type: CellType.packStation),
         WarehouseCell(row: 0, col: 6, type: CellType.packStation),
+        // EXPERIMENT: +3 pack stations (buffer 3 -> 6) to test whether the
+        // pack-station buffer capacity is the binding constraint on ships.
+        WarehouseCell(row: 2, col: 2, type: CellType.packStation),
+        WarehouseCell(row: 2, col: 4, type: CellType.packStation),
+        WarehouseCell(row: 2, col: 6, type: CellType.packStation),
         WarehouseCell(row: 0, col: 7, type: CellType.outbound),
         // Stocked racks — one per UOM so orders can route all three ways.
         WarehouseCell(

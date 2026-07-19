@@ -30,6 +30,7 @@ import '../widgets/tutorial_overlay.dart';
 import '../core/api_client.dart';
 import '../application/event_bus.dart';
 import '../application/robot_scout_simulation.dart';
+import '../application/brains/unit_brain.dart';
 import '../application/manual_robot_controller.dart';
 import '../widgets/wms_dashboard_panel.dart';
 
@@ -3148,6 +3149,51 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
+                    // ── Live sim diagnostic (top-left) ──────────────────────────
+                    // Pinpoints where the pipeline stalls when robots don't move:
+                    //   sim=no        -> Start Operations never launched the sim
+                    //   run=no        -> manual mode (no tick loop)
+                    //   tick stays 0  -> the timer isn't firing
+                    //   units=0       -> brains never registered
+                    //   tracked=0     -> positions never seeded
+                    //   moving=0      -> registered but not moving (no work/patrol)
+                    //   moving>0      -> they ARE moving; a render issue if unseen
+                    if (opsStarted)
+                      Positioned(
+                        top: 6,
+                        left: 6,
+                        child: Builder(builder: (_) {
+                          final sim = ref.watch(scoutSimulationProvider);
+                          final units = ref.watch(unitRegistryProvider);
+                          final pos = ref.watch(manualRobotPositionsProvider);
+                          final spawnHome = <String, String>{
+                            for (final s in (config?.robotSpawns ?? const []))
+                              (s.name ?? '${s.robotType}-${s.row}-${s.col}'):
+                                  '${s.row}_${s.col}'
+                          };
+                          var moving = 0;
+                          pos.forEach((id, p) {
+                            final h = spawnHome[id];
+                            if (h != null && '${p.row}_${p.col}' != h) moving++;
+                          });
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 4),
+                            color: const Color(0xCC0D1117),
+                            child: Text(
+                              'sim=${sim == null ? "no" : "yes"} '
+                              'run=${sim?.isRunning == true ? "yes" : "no"} '
+                              'tick=${sim?.tickNo ?? 0} '
+                              'units=${units.length} '
+                              'tracked=${pos.length} moving=$moving',
+                              style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Color(0xFF39FF14),
+                                  fontFamily: 'monospace'),
+                            ),
+                          );
+                        }),
+                      ),
                     // ── Floor canvas: all zoom/pan/tap gestures scoped to canvas only ──
                     Positioned.fill(
                       child: GestureDetector(

@@ -271,6 +271,11 @@ class RobotScoutSimulation {
   int _tickNo = 0;
   bool _brainsRegistered = false;
 
+  /// Diagnostics — how many ticks the autonomous loop has run, and whether the
+  /// brains were registered. (isRunning is defined below.)
+  int get tickNo => _tickNo;
+  bool get brainsRegistered => _brainsRegistered;
+
   // Cache cap: flush early when this many entries accumulate so individual
   // beacons stay well under the sendBeacon 64 KB limit.
   static const int _cacheCap = 75;
