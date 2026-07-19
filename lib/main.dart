@@ -185,6 +185,13 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     // Watch auth — redirect when state changes
     ref.listen<AuthState>(authProvider, (prev, next) {
       if (next is AuthLoggedIn) {
+        // EX-SAFETY: unlock backend writes for the OWNER session only. This is
+        // the single place the fail-closed ApiClient write guard is opened, tied
+        // to identity rather than to any screen — so no UI path can leak writes
+        // and none has to remember to gate itself. Auth/session writes bypass the
+        // guard by path, so login works for everyone regardless.
+        ApiClient.writesEnabled = next.user.isPrivileged;
+        manualControllerWritesEnabled = next.user.isPrivileged;
         // Start WebSocket when signed in
         ref.read(simFrameProvider.notifier).connect();
         _router.go('/dashboard');
@@ -198,6 +205,9 @@ class _WoisAppState extends ConsumerState<WoisApp> {
           _restoreExplorationState();
         }
       } else if (next is AuthLoggedOut || next is AuthError) {
+        // Re-lock writes on logout so a subsequent non-owner session starts closed.
+        ApiClient.writesEnabled = false;
+        manualControllerWritesEnabled = false;
         ref.read(simFrameProvider.notifier).disconnect();
         // Clear all in-memory warehouse state so the next user starts clean.
         _clearWarehouseState();

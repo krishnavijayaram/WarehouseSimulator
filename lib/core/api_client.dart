@@ -34,6 +34,47 @@ class ApiClient {
   Uri _uri(String path, [Map<String, String>? query]) =>
       Uri.parse('$gatewayBaseUrl$path').replace(queryParameters: query);
 
+  // ── EX-SAFETY WRITE GUARD (fail-closed) ───────────────────────────────────
+  //
+  // WIOS shares one Postgres instance with EventXplore's LIVE production, so
+  // only the owner session may mutate it. Every write verb routes through these
+  // wrappers instead of calling http.* directly — ONE choke point, because
+  // gating individual call sites was missed three separate times (floor_screen,
+  // then the desktop shell, then the creator autosave).
+  //
+  // Default FALSE = fails CLOSED: a write added anywhere in future is blocked
+  // until explicitly allowed, rather than silently reaching the shared DB.
+  // Reads (http.get) are untouched — those are gated at the polling providers.
+  static bool writesEnabled = false;
+
+  /// Auth/session writes must ALWAYS pass: they happen before we can know who
+  /// the user is, so gating them would make login impossible for everyone.
+  static bool _isAuthPath(Uri u) =>
+      u.path.contains('/users/sessions') || u.path.startsWith('/auth');
+
+  static http.Response get _blockedResponse => http.Response(
+      '{"error":"write blocked: EX-safety (non-owner session)"}', 403);
+
+  bool _mayWrite(Uri u) => writesEnabled || _isAuthPath(u);
+
+  Future<http.Response> _wPost(Uri u,
+      {Map<String, String>? headers, Object? body}) async {
+    if (!_mayWrite(u)) return _blockedResponse;
+    return http.post(u, headers: headers, body: body);
+  }
+
+  Future<http.Response> _wPatch(Uri u,
+      {Map<String, String>? headers, Object? body}) async {
+    if (!_mayWrite(u)) return _blockedResponse;
+    return http.patch(u, headers: headers, body: body);
+  }
+
+  Future<http.Response> _wDelete(Uri u,
+      {Map<String, String>? headers, Object? body}) async {
+    if (!_mayWrite(u)) return _blockedResponse;
+    return http.delete(u, headers: headers, body: body);
+  }
+
   // ── Auth ─────────────────────────────────────────────────────────────────
 
   /// GET /api/v1/users/sessions/{token} — validate stored token.
@@ -48,7 +89,7 @@ class ApiClient {
 
   /// POST /api/v1/users/sessions/{token}/invalidate — logout.
   Future<void> invalidateSession(String token) async {
-    await http.post(
+    await _wPost(
       _uri('/api/v1/users/sessions/$token/invalidate'),
       headers: {..._headers, 'Authorization': 'Bearer $token'},
     );
@@ -77,7 +118,7 @@ class ApiClient {
     required String sessionId,
     required String email,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/simulation/session/register'),
       headers: _headers,
       body: jsonEncode({'session_id': sessionId, 'email': email}),
@@ -105,25 +146,25 @@ class ApiClient {
 
   /// POST /api/v1/simulation/game-mode  body: {mode: "OPTION_3"}
   Future<void> setGameMode(String mode) async {
-    await http.post(_uri('/api/v1/simulation/game-mode'),
+    await _wPost(_uri('/api/v1/simulation/game-mode'),
         headers: _headers, body: jsonEncode({'mode': mode}));
   }
 
   /// POST /api/v1/simulation/pause
   Future<void> pauseSim() async {
-    await http.post(_uri('/api/v1/simulation/pause'), headers: _headers);
+    await _wPost(_uri('/api/v1/simulation/pause'), headers: _headers);
   }
 
   /// POST /api/v1/simulation/resume
   Future<void> resumeSim() async {
-    await http.post(_uri('/api/v1/simulation/resume'), headers: _headers);
+    await _wPost(_uri('/api/v1/simulation/resume'), headers: _headers);
   }
 
   // ── Wave ─────────────────────────────────────────────────────────────────
 
   /// POST /api/v1/agents/A1_wave_planner/run — trigger new wave
   Future<void> triggerWave() async {
-    await http.post(_uri('/api/v1/agents/A1_wave_planner/run'),
+    await _wPost(_uri('/api/v1/agents/A1_wave_planner/run'),
         headers: _headers);
   }
 
@@ -145,7 +186,7 @@ class ApiClient {
   /// POST /api/v1/game/action/{session_id}  body: {action: "BLOCK_CHARGER"}
   Future<Map<String, dynamic>> executeAction(
       String sessionId, String action) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/game/action/$sessionId'),
       headers: _headers,
       body: jsonEncode({'action': action}),
@@ -176,13 +217,13 @@ class ApiClient {
 
   /// POST /api/v1/layout/proposals/{id}/approve
   Future<void> approveProposal(String id) async {
-    await http.post(_uri('/api/v1/layout/proposals/$id/approve'),
+    await _wPost(_uri('/api/v1/layout/proposals/$id/approve'),
         headers: _headers);
   }
 
   /// POST /api/v1/layout/proposals/{id}/reject
   Future<void> rejectProposal(String id) async {
-    await http.post(_uri('/api/v1/layout/proposals/$id/reject'),
+    await _wPost(_uri('/api/v1/layout/proposals/$id/reject'),
         headers: _headers);
   }
 
@@ -190,7 +231,7 @@ class ApiClient {
 
   /// POST /api/v1/sim-chat/sessions — creates a session, returns its id.
   Future<String> createChatSession(String token) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/sim-chat/sessions'),
       headers: _headers,
       body: jsonEncode({'token': token, 'name': 'Flutter chat'}),
@@ -204,7 +245,7 @@ class ApiClient {
     required String sessionId,
     required String message,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/sim-chat/$sessionId/messages'),
       headers: _headers,
       body: jsonEncode({'message': message}),
@@ -224,7 +265,7 @@ class ApiClient {
     required String authSessionId,
     Map<String, dynamic>? simContext,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/sim-chat/$chatSessionId/messages'),
       headers: _headers,
       body: jsonEncode({
@@ -302,7 +343,7 @@ class ApiClient {
     required String userId,
     String userName = '',
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/warehouses/$warehouseId/heartbeat'),
       headers: _headers,
       body: jsonEncode({
@@ -321,7 +362,7 @@ class ApiClient {
     required String sessionId,
   }) async {
     try {
-      await http.delete(
+      await _wDelete(
         _uri('/api/v1/warehouses/$warehouseId/heartbeat',
             {'session_id': sessionId}),
         headers: _headers,
@@ -374,7 +415,7 @@ class ApiClient {
     required String configJson,
     String ownerId = 'local',
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/warehouses/publish'),
       headers: _headers,
       body: jsonEncode({
@@ -395,7 +436,7 @@ class ApiClient {
     required String configJson,
     String ownerId = 'local',
   }) async {
-    await http.patch(
+    await _wPatch(
       _uri('/api/v1/warehouses/$warehouseId/draft'),
       headers: _headers,
       body: jsonEncode({
@@ -421,7 +462,7 @@ class ApiClient {
   /// POST /api/v1/warehouses/{id}/skus/{sku_id} — copy a global SKU into warehouse.
   Future<Map<String, dynamic>> addSkuToWarehouse(
       String warehouseId, String skuId) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/warehouses/$warehouseId/skus/$skuId'),
       headers: _headers,
     );
@@ -430,7 +471,7 @@ class ApiClient {
 
   /// DELETE /api/v1/warehouses/{id}/skus/{sku_id} — remove SKU from warehouse.
   Future<void> removeSkuFromWarehouse(String warehouseId, String skuId) async {
-    await http.delete(
+    await _wDelete(
       _uri('/api/v1/warehouses/$warehouseId/skus/$skuId'),
       headers: _headers,
     );
@@ -466,7 +507,7 @@ class ApiClient {
     String abcClass = 'B',
     required String requestingEmail,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/master/skus'),
       headers: _headers,
       body: jsonEncode({
@@ -507,7 +548,7 @@ class ApiClient {
     String? obstacleLabel,
     int? durationSeconds,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/reality/aisle_block'),
       headers: _sabotageHeaders,
       body: jsonEncode({
@@ -530,7 +571,7 @@ class ApiClient {
     required int row,
     required int col,
   }) async {
-    await http.delete(
+    await _wDelete(
       _uri('/api/v1/reality/aisle_block/$warehouseId/$row/$col'),
       headers: _sabotageHeaders,
     );
@@ -558,7 +599,7 @@ class ApiClient {
     required int col,
     String exploredBy = 'MANUAL_EXPLORE',
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/reality/explore'),
       headers: _headers,
       body: jsonEncode({
@@ -596,7 +637,7 @@ class ApiClient {
     String truckType = 'M',
     String carrierName = 'AUTO',
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/yms/inbound-orders'),
       headers: _headers,
       body: jsonEncode({
@@ -615,7 +656,7 @@ class ApiClient {
   /// WAITING. Used when the 60-second background task was lost.
   /// Returns `{status, truck_id, slot_id, message}`.
   Future<Map<String, dynamic>> dispatchTruck(String truckId) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/yms/trucks/$truckId/force-arrive'),
       headers: _headers,
     );
@@ -627,7 +668,7 @@ class ApiClient {
   /// Manually dispatches a PACKED outbound order.
   /// Returns `{status, order_id, message}`.
   Future<Map<String, dynamic>> dispatchOutbound(String orderId) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/oms/outbound/$orderId/dispatch'),
       headers: _headers,
     );
@@ -647,7 +688,7 @@ class ApiClient {
     int priorityActual = 3,
     int actualSlaHours = 48,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/oms/outbound'),
       headers: _headers,
       body: jsonEncode({
@@ -742,7 +783,7 @@ class ApiClient {
     required String skuId,
     int qty = 1,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/transactions/pick'),
       headers: _headers,
       body: jsonEncode({
@@ -767,7 +808,7 @@ class ApiClient {
     required String destId,
     int qty = 1,
   }) async {
-    final r = await http.post(
+    final r = await _wPost(
       _uri('/api/v1/transactions/drop'),
       headers: _headers,
       body: jsonEncode({
