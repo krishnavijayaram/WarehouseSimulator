@@ -54,7 +54,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
               children: [
                 // ── Header ──────────────────────────────────────────────────
                 const Text(
-                  '⬡ WOIS',
+                  '⬡ WIOS',
                   style: TextStyle(
                     fontSize: 40,
                     color: Color(0xFF00D4FF),
@@ -64,7 +64,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  'Warehouse AI Simulator',
+                  'Warehouse Intelligence & Operations System',
                   style: TextStyle(fontSize: 13, color: Color(0xFF8B949E)),
                 ),
                 const SizedBox(height: 8),

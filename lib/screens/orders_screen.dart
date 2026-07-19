@@ -11,6 +11,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../application/providers.dart';
 import '../core/api_client.dart';
+import '../core/auth/auth_provider.dart';
 
 // ── Colour aliases (match AdaptiveShell palette) ──────────────────────────────
 
@@ -96,6 +97,7 @@ class _InboundTabState extends ConsumerState<_InboundTab> {
   }
 
   Future<void> _load() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session polls only
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) return;
     try {
@@ -226,13 +228,37 @@ class _InboundOrderDialogState extends ConsumerState<_InboundOrderDialog> {
       _error = null;
     });
     try {
-      final result = await ApiClient.instance.createInboundOrder(
-        warehouseId: cfg.id,
-        lines: _lines
-            .map((l) => {'sku_id': l.skuId, 'qty_pallets': l.qtyPallets})
-            .toList(),
-        truckType: _truckType,
-      );
+      final orderLines = _lines
+          .map((l) => {'sku_id': l.skuId, 'qty_pallets': l.qtyPallets})
+          .toList();
+      Map<String, dynamic> result;
+      try {
+        result = await ApiClient.instance.createInboundOrder(
+          warehouseId: cfg.id,
+          lines: orderLines,
+          truckType: _truckType,
+        );
+      } on ApiException catch (e) {
+        // Warehouse row missing in DB (e.g. after a server reset) — re-publish
+        // the config so the backend recognises this warehouse, then retry once.
+        if (e.statusCode == 404 && e.message.contains('Warehouse')) {
+          final auth = ref.read(authProvider);
+          final userId = auth is AuthLoggedIn ? auth.user.id : 'local';
+          await ApiClient.instance.publishWarehouse(
+            warehouseId: cfg.id,
+            name: cfg.name,
+            configJson: cfg.toShareCode(),
+            ownerId: userId,
+          );
+          result = await ApiClient.instance.createInboundOrder(
+            warehouseId: cfg.id,
+            lines: orderLines,
+            truckType: _truckType,
+          );
+        } else {
+          rethrow;
+        }
+      }
       if (mounted) {
         final truckId = result['truck_id'] as String? ?? '?';
         ScaffoldMessenger.of(context).showSnackBar(
@@ -682,7 +708,8 @@ class _OrderCardState extends ConsumerState<_OrderCard> {
               padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
               child: Row(
                 children: [
-                  const Icon(Icons.precision_manufacturing, size: 12, color: _green),
+                  const Icon(Icons.precision_manufacturing,
+                      size: 12, color: _green),
                   const SizedBox(width: 6),
                   Text(
                     status == 'PICKING'
@@ -709,9 +736,8 @@ class _OrderCardState extends ConsumerState<_OrderCard> {
                         fontSize: 11, fontWeight: FontWeight.bold),
                     padding: const EdgeInsets.symmetric(vertical: 8),
                   ),
-                  onPressed: _dispatching
-                      ? null
-                      : () => _dispatchOutbound(orderId),
+                  onPressed:
+                      _dispatching ? null : () => _dispatchOutbound(orderId),
                   icon: _dispatching
                       ? const SizedBox(
                           width: 12,
@@ -891,6 +917,7 @@ class _OutboundTabState extends ConsumerState<_OutboundTab> {
   }
 
   Future<void> _load() async {
+    if (!ref.read(isSimOwnerProvider)) return; // EX-safety: owner session polls only
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) return;
     try {

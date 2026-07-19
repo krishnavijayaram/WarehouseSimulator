@@ -21,6 +21,8 @@ class DashboardScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final auth = ref.watch(authProvider);
     final frame = ref.watch(simFrameProvider);
+    final liveRobots = ref.watch(liveRobotsProvider).valueOrNull;
+    final robots = liveRobots ?? frame.robots;
     final trucksData = ref.watch(inboundTrucksProvider);
     final inboundTrucks = trucksData.valueOrNull?.trucks ?? const [];
     final shipmentsByTruck =
@@ -98,8 +100,8 @@ class DashboardScreen extends ConsumerWidget {
                     // ── Scouting progress + WMS inventory ────────────────────────────────
                     const WmsDashboardPanel(),
                     // ── Robots ───────────────────────────────────────────────────────────
-                    _SectionHeader('Fleet (${frame.robots.length} robots)'),
-                    ...frame.robots
+                    _SectionHeader('Fleet (${robots.length} robots)'),
+                    ...robots
                         .map((r) => RobotCard(robot: r, cargo: cargoMap[r.id])),
 
                     // ── Inbound Trucks ───────────────────────────────────────────────────
@@ -596,9 +598,9 @@ class TruckFleetCard extends StatelessWidget {
                                       fontSize: 8, color: Color(0xFF8B949E))),
                               if (picked > 0) ...[
                                 const SizedBox(height: 2),
-                                Text('−$picked picked',
+                                Text('$picked unloaded',
                                     style: const TextStyle(
-                                        fontSize: 9, color: Color(0xFFFF8800))),
+                                        fontSize: 9, color: Color(0xFF00FF88))),
                               ],
                             ],
                           ),

@@ -35,6 +35,9 @@ import '../env.dart';
 import '../models/warehouse_config.dart';
 import '../core/auth/auth_provider.dart';
 import 'providers.dart';
+import 'sim_bootstrap.dart';
+import 'brains/unit_brain.dart';
+import 'brains/unit_scheduler.dart';
 
 // ── Movement priority: Down / Left / Right / Up ───────────────────────────────
 const List<({int dr, int dc, String name})> kPriority = [
@@ -237,6 +240,9 @@ class RobotScoutSimulation {
     required this.config,
     required this.ref,
     required this.isSaboteur,
+    // EX-SAFETY: OFF by default so the deployed sim NEVER writes to the backend
+    // shared with EventXplore. Only opt in for local/dev WMS sync.
+    this.backendSync = false,
     this.stepIntervalMs = 400,
     String? backendBase,
   }) : backendBase = backendBase ?? gatewayBaseUrl {
@@ -251,12 +257,19 @@ class RobotScoutSimulation {
   final int stepIntervalMs;
   final String backendBase;
 
+  /// EX-SAFETY hard switch. When false (the deployed default) the sim makes ZERO
+  /// backend writes, so it adds no load to the Postgres instance shared with
+  /// EventXplore — the simulation cannot impact EX by any path.
+  final bool backendSync;
+
   final List<ScoutBot> _bots = [];
   final List<_CacheEntry> _cache = [];
   final Set<String> _cacheKeys = {}; // O(1) dedup index by 'row,col'
   Timer? _stepTimer;
   Timer? _flushTimer;
   bool _running = false;
+  int _tickNo = 0;
+  bool _brainsRegistered = false;
 
   // Cache cap: flush early when this many entries accumulate so individual
   // beacons stay well under the sendBeacon 64 KB limit.
@@ -293,24 +306,6 @@ class RobotScoutSimulation {
       );
       _bots.add(ScoutBot(
           id: 'default-bot', row: first.row, col: first.col, isTruck: false));
-    }
-  }
-
-  // ── Seed initial reveal for all bot starting positions ───────────────────
-  // Only reveals fog-of-war around spawn points — does NOT record inventory
-  // discoveries.  WMS is populated exclusively when robots physically move
-  // and scan rack locations (via _tick → _recordDiscoveriesAt).
-
-  void _seedInitialReveal() {
-    final exploredN = ref.read(exploredCellsProvider.notifier);
-    for (final bot in _bots) {
-      final revealed = bot.initialReveal(config);
-      for (final key in revealed) {
-        final parts = key.split(',');
-        exploredN.markExplored(int.parse(parts[0]), int.parse(parts[1]));
-      }
-      // NOTE: no _recordDiscoveriesAt here — robots must physically move to
-      // a cell before it is reported to the WMS backend.
     }
   }
 
@@ -366,32 +361,51 @@ class RobotScoutSimulation {
   // ── Internal tick ─────────────────────────────────────────────────────────
 
   void _tick() {
-    // Robots never pause — flush happens in the background.
-    final exploredN = ref.read(exploredCellsProvider.notifier);
-    final current = ref.read(exploredCellsProvider);
+    _ensureBrainsRegistered();
 
-    for (final bot in _bots) {
-      if (bot.isTruck) continue; // trucks are stationary
-      final newly = bot.step(config, current);
-      for (final key in newly) {
-        final parts = key.split(',');
-        exploredN.markExplored(int.parse(parts[0]), int.parse(parts[1]));
-      }
-      _recordDiscoveriesAt(bot.row, bot.col, bot.id);
+    // Decentralized unit brains advance one tick (P0: scouts; ops units land in
+    // later phases). Fog reveal happens inside ActionApplier.moveTo.
+    UnitScheduler(ref).tick(config, _tickNo++);
+
+    // Record what each scout now sees at its position (WMS discovery cache).
+    final units = ref.read(unitRegistryProvider);
+    for (final u in units.values) {
+      // Record what each on-grid unit sees now (WMS discovery cache). Every
+      // moving robot reveals, so this no longer depends on scouts specifically.
+      if (u.pos.row >= 0) _recordDiscoveriesAt(u.pos.row, u.pos.col, u.id);
     }
 
-    // Tick inbound & putaway controllers (AI auto-execution)
-    final inboundCtrl = ref.read(inboundOpsControllerProvider);
-    if (inboundCtrl != null) {
-      inboundCtrl.tick();
-    }
-    final putawayCtrl = ref.read(palletPutawayControllerProvider);
-    if (putawayCtrl != null) {
-      putawayCtrl.tick();
-    }
+    // NOTE: the legacy InboundOpsController / PalletPutawayController are NOT
+    // ticked here anymore. Their brain equivalents (InboundRobotBrain,
+    // PutawayRobotBrain) have landed (P2–P3) and now own inbound + putaway via
+    // the scheduler above. Running both drove the SAME robots through
+    // manualRobotPositionsProvider on the same tick — they fought over
+    // positions (jitter/teleport) — and the legacy pair also POSTed
+    // pick/dropTransaction to the shared backend, which the local sim must not
+    // do. The controllers stay instantiated only so manual mode's D-pad actions
+    // (floor_screen manualPickFromTruck / manualPickFromStaging) still work.
 
     // Early flush: if the cache is full, send now without waiting for the timer.
     if (_cache.length >= _cacheCap) _flush();
+  }
+
+  /// One-time registration of a ScoutBrain per non-truck robot spawn into the
+  /// shared registry. Retires the old ScoutBot movement: positions now flow
+  /// through manualRobotPositionsProvider, which the renderer already honors by
+  /// overriding a scout's drawn position with its manual-position entry.
+  void _ensureBrainsRegistered() {
+    if (_brainsRegistered) return;
+    _brainsRegistered = true;
+    // Register the FULL loop — operational robot brains + the work generators
+    // (StockMonitor, OutboundOrderGenerator) — so robots actually do warehouse
+    // work, not just scout. They still reveal fog as they move.
+    // (Previously only ScoutBrains were registered → the app explored but no
+    //  robot ever moved: the exact "magic show" bug.)
+    final robots = [
+      for (final bot in _bots)
+        if (!bot.isTruck) (id: bot.id, row: bot.row, col: bot.col),
+    ];
+    bootstrapSimUnits(ref, config, robots);
   }
 
   // ── Record what the robot sees at its current position ───────────────────
@@ -486,6 +500,13 @@ class RobotScoutSimulation {
     final batch = List<_CacheEntry>.from(_cache);
     _cache.clear();
     _cacheKeys.clear();
+
+    // ── EX-SAFETY HARD GATE ──────────────────────────────────────────────────
+    // The deployed sim runs client-only. With backendSync off it issues NO
+    // network write here (no sendBeacon, no HTTP), so it contributes zero load
+    // to the Postgres instance shared with EventXplore. The cache is already
+    // drained above, so memory stays bounded whether or not we deliver.
+    if (!backendSync) return;
 
     final auth = ref.read(authProvider);
     final sessionId = auth is AuthLoggedIn

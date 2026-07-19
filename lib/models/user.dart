@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 
 // ── Role levels (mirrors WIOS/warehouse_core/models/chat_auth.py ROLE_LEVELS) ─
 
+const _kPrivilegedEmails = {'krishnavijayaram@gmail.com'};
+
 const Map<String, int> kRoleLevels = {
   'Viewer':     1,
   'Operator':   2,
@@ -43,10 +45,11 @@ class WoisUser {
   final String  provider;
   final bool    isActive;
 
-  int  get level      => role.level;
-  bool get canAdmin   => role.canAdmin;
-  bool get canSabotage => role.canSabotage;
-  bool get canAiObs   => role.canAiObs;
+  int  get level        => role.level;
+  bool get canAdmin     => role.canAdmin;
+  bool get canSabotage  => role.canSabotage;
+  bool get canAiObs     => role.canAiObs;
+  bool get isPrivileged => _kPrivilegedEmails.contains(email.toLowerCase());
 
   factory WoisUser.fromJson(Map<String, dynamic> j) => WoisUser(
     id:        j['id']         as String? ?? '',

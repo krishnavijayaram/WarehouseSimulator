@@ -1,0 +1,580 @@
+{
+ "plan": {
+  "summary": "19-step plan, dependency-ordered: seeded-RNG substrate \u00e2\u2020\u2019 cell/capacity model \u00e2\u2020\u2019 job-board multi-line Order model \u00e2\u2020\u2019 stage store \u00e2\u2020\u2019 work generators (random demand, truck pooling) \u00e2\u2020\u2019 truck/robot brains (landing, cross-dock, quantity, grouping, charging) \u00e2\u2020\u2019 bootstrap wiring \u00e2\u2020\u2019 tests.\n\nTHREE ARCHITECTURAL CONSTRAINTS discovered while reading the code, which the plan is built around:\n\n1. CellType is INDEX-SERIALIZED. warehouse_config.dart:319 writes `'t': type.index` and :330 reads `CellType.values[j['t'] as int]`. `landing`/`outboundStage` MUST be appended at indices 33/34. Inserting them next to the other staging types (the \"natural\" spot) silently remaps every persisted layout and share-code. Their label/color switches are exhaustive `switch` expressions, so step 2 breaks compilation across the UI until every arm is added \u00e2\u20ac\u201d that is exactly the \"enum/exhaustive-switch churn\" outbound_stage.dart:7-9 deferred, and it cannot be deferred again.\n\n2. THE SINGLE-UOM COUPLING IS LOAD-BEARING AND MUST BE CUT ATOMICALLY. sim_bootstrap.dart:58+66 gives every picker one warehouse-wide UOM from `_warehousePickUom`, and outbound_order_generator_brain.dart:91 derives order UOM from the same first-stocked-rack scan. The comment at sim_bootstrap.dart:54-57 states these agree *by construction*. Job.matchesRole (job_board.dart:208) hard-gates on UOM, and claimableFor filters BEFORE the attempts counter increments \u00e2\u20ac\u201d so a UOM-mismatched job is never claimed, never counted, never failed, and its Order never aborts. Fixing either side alone (random UOM without heterogeneous pickers, or heterogeneous pickers without mixed demand) produces permanently unclaimable jobs \u00e2\u2020\u2019 Order pinned open \u00e2\u2020\u2019 wipCap blocks all future orders \u00e2\u2020\u2019 docked truck holds its bay forever. Steps 7 and 18 must land together.\n\n3. RANDOM QUANTITY IS A LIVE DEADLOCK, NOT A GRADUAL DEGRADATION. pick_robot_brain.dart:136 hardcodes `pickFromRack(..., 1)` and :177 completes the job unconditionally; it never reads job.qtyUnits. Because completeJob passes no progressUnits, job_board.dart:392 does not advance the Order \u00e2\u20ac\u201d so a 144-unit order does not under-deliver, it WEDGES at 48/144 with no job left to mint the remainder and no watchdog reachable (the job already settled `done`). Step 14 is therefore a hard prerequisite of step 7's random quantity, not a follow-up.\n\nTEST IMPACT: 6 of the 21 currently-passing tests encode behaviour this spec reverses and must be rewritten as part of the step that breaks them \u00e2\u20ac\u201d regression_putaway_capacity (step 3: asserts the 48\u00e2\u2020\u20192 fall-through the fix removes), p2_unload_chain (step 11: unloads a truck that was never registered), p4_outbound_loop + p4_outbound_loose (steps 7/8: assert 1:1 truck/order and immediate depart), p4_pick + regression_multipicker (step 6: read stage values as bare Strings). Determinism is preserved by threading one injected `Random` (step 1) through every generator, with tests pinning the seed.\n\nDEAD SCAFFOLDING TO WIRE, NOT REBUILD: OrderLine, Order.lines, Order.divert()/divertedUnits, JobKind.rebalance/departTruck/recovery, OutboundOrderGeneratorBrain.orderUnits, kTruckCapacity, PickZoneType/PickZoneDef, and ScoutBrain all exist and are never constructed/read. Several plan steps are wiring these up rather than writing new models. Notably, the three pick areas of spec 5(a)(b)(c) are ALREADY modelled as PickZoneDef (warehouse_config.dart:176-250, painted by the template factory, paintable in the creator) and are merely cosmetic \u00e2\u20ac\u201d bind them in pick_robot_brain (step 14); do NOT resurrect the looseStaging/caseStaging CellTypes, which would duplicate that model.",
+  "steps": [
+   {
+    "order": 1,
+    "title": "Seeded RNG substrate (determinism gate for all later randomness)",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_random.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart"
+    ],
+    "what": "NEW file sim_random.dart: `const int kSimSeed = 20260716;`, a `simSeedProvider`, and a thin `SimRng` wrapping `dart:math` Random(seed) exposing nextIntIn(min,max) / pickWeighted / jitter. Rule to enforce from here on: NO brain may construct its own Random or read a clock \u00e2\u20ac\u201d the RNG is injected via constructor so a test can pin it. Today `grep -rn 'dart:math|Random' lib/application/` returns ZERO hits, so this establishes the only sanctioned entry point before steps 7/10 introduce randomness. bootstrapSimUnits builds one SimRng from kSimSeed and hands derived child RNGs (seed+roleOffset) to the generator brains, so adding a consumer never shifts another consumer's draw sequence \u00e2\u20ac\u201d the property the JEPA eval depends on.",
+    "risk": "None \u00e2\u20ac\u201d additive, no existing behaviour touched. This step exists specifically so 'random' in steps 7/10 can never become wall-clock random."
+   },
+   {
+    "order": 2,
+    "title": "CellType: append `landing` + `outboundStage` (APPEND-ONLY \u00e2\u20ac\u201d index-serialized)",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/warehouse_template_factory.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/screens/warehouse_creator_screen.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/screens/floor_screen.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/widgets/adaptive_shell.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/warehouse_readiness.dart"
+    ],
+    "what": "Append `landing` (33) and `outboundStage` (34) to the END of the CellType enum (warehouse_config.dart:12-48). MUST be appended, never inserted next to the other staging types: toJson writes `'t': type.index` (:319) and fromJson reads `CellType.values[j['t'] as int]` (:330), so a mid-enum insert silently remaps every saved layout and share-code. Add arms to the exhaustive label/color switches (:50-110), `_defaultMaxQty`, isWalkable, and the domain predicates at :156-159 \u00e2\u20ac\u201d both are robot-enterable buffers, so mirror palletStaging semantics. Add both to the creator palette (:34-35). Template factory paints a landing strip adjacent to the inbound dock and an outboundStage block adjacent to the outbound bays \u00e2\u20ac\u201d reuse the existing pack-column alignment logic at :444-457 ('Pack station must always sit directly adjacent to the dock bays'), which is why factory layouts get adjacency today. Add readiness checks for both. Keep packStation accepted as a legacy alias for outboundStage so the p4 tests stay green until step 6 retargets the stage.",
+    "risk": "WIDEST BLAST RADIUS OF ANY STEP, but it fails LOUDLY not silently: the label/color switches are exhaustive switch expressions, so every unhandled arm is a compile error across the UI \u00e2\u20ac\u201d that is precisely the churn outbound_stage.dart:7-9 deferred ('the distinct cell type lands with pack/load'; pack/load landed, the cell type never did). The only silent-corruption risk is enum ordering \u00e2\u20ac\u201d append-only is non-negotiable. No test asserts CellType.values.length.",
+    "dependsOn": "none"
+   },
+   {
+    "order": 3,
+    "title": "Rack capacity in native units + configurable reorder point (unblocks dead 5.2/5.3)",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/warehouse_template_factory.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/putaway_robot_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/pallet_putaway_controller.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/regression_putaway_capacity_test.dart"
+    ],
+    "what": "Two coupled unit-system bugs. (a) `_defaultMaxQty` (warehouse_config.dart:311-315) returns rackCase=2 / rackLoose=2 while `_belowThreshold` demands room >= kCasesPerPallet(12) / kLoosePerPallet(48) \u00e2\u20ac\u201d 2 < 12 < 48, so rules 5.2 and 5.3 are UNREACHABLE in every generated warehouse and 100% of pallets fall through to 5.4. Express face capacity in the same native units as the drop (e.g. rackCase >= 24 cases, rackLoose >= 96 loose). (b) Replace the hardcoded `quantity < maxQuantity * 0.5` getter (:302-303) with a `reorderPoint` field (default derived, with a non-zero floor) \u00e2\u20ac\u201d at capacity 2 the current expression is `quantity < 1.0`, i.e. it only fires at ZERO, so case/loose faces must fully stock out before any inbound is raised. Consolidate the 0.5 constant, which is triplicated (warehouse_config.dart:302, putaway_robot_brain.dart:30, pallet_putaway_controller.dart:39 \u00e2\u20ac\u201d at capacity 2 a face at qty 1 gives `0.5 < 0.5` = false, so putaway won't top it up either). Also fix warehouse_template_factory.dart:100-101, which seeds case/loose at 30-70% of capacity 2 \u00e2\u2020\u2019 qty 1, i.e. one pick from a stockout that the trigger cannot see.",
+    "risk": "BREAKS regression_putaway_capacity_test.dart \u00e2\u20ac\u201d it deliberately seeds a loose face at maxQuantity:2 and asserts (:73-76) the too-small loose rack is left UNTOUCHED while the pallet lands in the pallet rack ('no 48\u00e2\u2020\u20192 destruction'). That test encodes the opposite of this fix. Rewrite it to assert the new capacity-aware intent, KEEPING an explicit maxQuantity:2 case to prove the annihilation guard still holds when a face genuinely is too small. Also touches p3_inbound_loop_test (maxQuantity:2, quantity:0 \u00e2\u20ac\u201d still low, should stay green) and the creator's quantity clamp (warehouse_creator_screen.dart:1398/1410).",
+    "dependsOn": "none"
+   },
+   {
+    "order": 4,
+    "title": "Putaway: partial drop + neediest-face-first ranking",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/putaway_robot_brain.dart"
+    ],
+    "what": "`_belowThreshold` (:248-263) is all-or-nothing (`room >= need`) and first-match on cfg.cells order. Change to fill-what-fits + return the remainder for the next candidate, and rank candidate faces by fillFraction (neediest first) instead of taking the first hit. Also fix the empty-face branch (:256-259), which checks neither SKU nor threshold, so the first empty loose face in scan order pre-empts 5.3/5.4 even when the case area is starving. NOTE: applying kReplenishThreshold to the empty branch is a no-op (an empty face has fillFraction 0, below any positive threshold) \u00e2\u20ac\u201d the real defect is the missing SKU check and the missing ranking.",
+    "risk": "Low once step 3 lands. Partial drop is the alternative to (or complement of) step 3's capacity reconciliation; doing both makes 5.2/5.3 robust for hand-authored layouts that still carry small faces.",
+    "dependsOn": "3"
+   },
+   {
+    "order": 5,
+    "title": "job_board: multi-line Order model, per-line progress, cross-dock job kind",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart"
+    ],
+    "what": "Wire the dead scaffolding rather than inventing a model. OrderLine (:68-75) exists but `OrderLine(` is constructed NOWHERE and `Order.lines` is never read. Add `skuId` + `progressUnits` + `status` to OrderLine (rename `id`\u00e2\u2020\u2019`lineId`; today's `id` is ambiguously named and cannot vary SKU). Order: keep `skuId` as a derived back-compat getter (`lines.first.skuId`) so the single-SKU inbound path and p4_pick_test.dart:60 stay green, and make `orderedUnits` derive from \u00ce\u00a3 lines. Add `Job.lineId`, `Order.assignedTruckId`, `Order.stagedUnits`/`isFullyStaged` (spec-2 grouping predicate \u00e2\u20ac\u201d `isSatisfied` at :120 is a post-hoc ALL-UNITS-LOADED test, not a pre-load consolidation gate). completeJob (:386-397) attributes progress to the line via `j.lineId` then rolls up to the Order. Assign the never-written `OrderStatus.fulfilling` (:65 \u00e2\u20ac\u201d declared, read at 2 sites, assigned nowhere) on first progress. Add `JobKind.crossDock` + `Job.divertedFromInboundLineId` for step 13. Keep a `mintOrder(skuId:...)` convenience overload that builds a single line, so the two existing call sites don't churn.",
+    "risk": "Signature ripple to stock_monitor_brain.dart:54, outbound_order_generator_brain.dart:55, p4_pick_test.dart:60 \u00e2\u20ac\u201d contained by the back-compat overload. Preserve the zero-padded `_nextId` (:250-252) and the id-sorted claimableFor (:313): both are deliberate FIFO-determinism guarantees for the JEPA eval. Also preserve the sweepTerminal idem-prefix prune (:444-452), whose `'$oid:'` scheme the new per-line idemKeys must keep matching.",
+    "dependsOn": "none"
+   },
+   {
+    "order": 6,
+    "title": "outbound_stage: carry order identity, retarget to CellType.outboundStage",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/outbound_stage.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/action_applier.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_pick_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/regression_multipicker_test.dart"
+    ],
+    "what": "State becomes `Map<String, StagedItem>` where StagedItem = {skuId, orderId, lineId, units} \u00e2\u20ac\u201d today it is `Map<String,String>` cellKey\u00e2\u2020\u2019skuId (:14-23), so NOTHING in the codebase can answer 'what is staged for order X', which makes spec-2 grouping unrepresentable rather than merely unimplemented. Add `cellsFor(orderId)` and `stagedUnits(orderId)`. Thread orderId/lineId through ActionApplier.stageOutbound (:136-139) and takeFromStage (:144-151) \u00e2\u20ac\u201d preserve takeFromStage's `false`-on-empty contract (review HT-1, the phantom-load guard). Retarget the stage from packStation to CellType.outboundStage (step 2), keeping packStation as a fallback so unmigrated layouts still run. Delete the now-stale reuse note at outbound_stage.dart:7-9.",
+    "risk": "BREAKS p4_pick_test.dart:86 and regression_multipicker_test.dart:74, which read stage values as bare Strings. Mechanical fix (`.values.map((e) => e.skuId)`). p4_outbound_loop_test's `.isEmpty` check on the map still works.",
+    "dependsOn": "2, 5"
+   },
+   {
+    "order": 7,
+    "title": "Outbound generator: seeded random SKU/UOM/qty/timing + multi-line explosion",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/warehouse_template_factory.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_outbound_loop_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_outbound_loose_test.dart"
+    ],
+    "what": "Rewrite perceiveAndDecide (:33-77) \u00e2\u20ac\u201d this single method is spec point 1 in its entirety. (a) SKU: sample via injected SimRng from the SKU CATALOG `kAllSkuIds` (warehouse_template_factory.dart:34, currently never imported by any brain), NOT from `_firstStocked` (:87-95) which scans live rack contents \u00e2\u20ac\u201d demand must be able to request an out-of-stock SKU, which is the very trigger spec 3 needs. Bound simultaneous zero-stock orders. (b) UOM: sample per line, independent of rack type \u00e2\u20ac\u201d today `rackUomOf(c.type)` (:91) makes demand UOM a property of the STORAGE LAYOUT, so a rackLoose-painted warehouse (the creator default) emits loose orders forever. (c) Quantity: random multiple of the line's UOM \u00e2\u20ac\u201d today `units = stocked.uom.looseUnits` (:53) is always exactly 1/4/48. Delete the dead `orderUnits` field (:20,:28 \u00e2\u20ac\u201d declared, never read; a knob wired to nothing is worse than no knob). (d) Timing: add `_nextEmitAtTick = tick + interval \u00c2\u00b1 jitter` from the RNG; `ctx.tick` is currently read ONLY to stamp createdTick (:59) and never gates emission. (e) Explode one pickToStage Job per line with idemKey `'${order.id}:L$i:0'` \u00e2\u20ac\u201d the hardcoded `:L0:0` (:67) is vestigial for lines that never existed. (f) Raise wipCap (:19) from 1 to ~3-4. (g) Stop the 1:1 truck spawn (:70-76) \u00e2\u2020\u2019 step 8.",
+    "risk": "MUST LAND WITH STEP 18 (see summary constraint 2) and MUST NOT LAND BEFORE STEP 14 (constraint 3). Random UOM without heterogeneous pickers mints jobs no picker can claim, which are filtered out by claimableFor BEFORE the attempts counter can fire the releaseOrFail watchdog \u00e2\u2020\u2019 permanent wedge. Random quantity without step 14's qty loop deadlocks at 48/144. BREAKS p4_outbound_loop_test and p4_outbound_loose_test (both assume one deterministic order); give the brain a pinned-seed + single-line demandProfile param so those tests pin exact behaviour. Add a determinism test: same seed \u00e2\u2020\u2019 byte-identical order stream.",
+    "dependsOn": "1, 5, 14, 18"
+   },
+   {
+    "order": 8,
+    "title": "Outbound truck: multi-order manifest, capacity, depart-when-full",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_truck_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/constants/packaging_constants.dart"
+    ],
+    "what": "`final String orderId` (:28) \u00e2\u2020\u2019 `List<String> _orders` + `capacityUnits` + `loadedUnits` + `acceptingLoad`. The truck is structurally incapable of carrying a second order today, so 'depart when full' degenerates to 'depart when my one unit is loaded'. Generator assigns an order to an existing accepting truck with room and spawns a new truck only when none exists. Departure gate (:84-102) becomes `isFull || (dwellTicks > kMaxDwellTicks && loadedUnits > 0)` instead of `order.isSatisfied` \u00e2\u20ac\u201d the dwell timeout is REQUIRED, else a half-full truck holds its bay forever and wipCap stalls the loop. Wire the real capacity data at packaging_constants.dart:36-83 (kTruckCapacity S/M/L/XL is fully defined and referenced by ZERO files outside its own barrel re-export), or a simpler kOutboundTruckCapacityUnits. Mint the never-minted JobKind.departTruck (job_board.dart:143) or delete it.",
+    "risk": "BREAKS p4_outbound_loop_test \u00e2\u20ac\u201d it asserts `whereType<OutboundTruckBrain>()` isEmpty after 220 ticks; a capacity-gated truck won't depart on one unit until the dwell timeout. Extend the tick budget or pin capacity to one unit in the fixture. Keep the existing kMaxSeekTicks abort (:31,:69-74, review HT-2) intact \u00e2\u20ac\u201d step 11 copies it to the inbound side.",
+    "dependsOn": "5, 7"
+   },
+   {
+    "order": 9,
+    "title": "Close the Order at DEPARTURE, not at load",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_robot_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_truck_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart"
+    ],
+    "what": "outbound_robot_brain.dart:124 `completeJob(progressUnits:)` reaches job_board.dart:392-395 and closes the Order the instant progress hits orderedUnits \u00e2\u20ac\u201d while the truck is still parked in the bay. Departure is then a consequence, not the cause (the truck polls and sees isSatisfied at :87-90), so an order is reported shipped before the truck moves a cell, and sweepTerminal can delete the closed Order out from under the still-docked truck (which is why the defensive `order == null` branch exists). Make the load credit the truck's fill counter (step 8) and set OrderStatus.fulfilling; the truck calls closeOrder on ACTUAL departure. Fix the now-false header note at outbound_truck_brain.dart:7 ('Departure closing the order = shipped == loaded').",
+    "risk": "Changes when p4_outbound_loop_test's open-order assertion flips \u00e2\u20ac\u201d it already asserts the order closes 'on departure' (its own stated reason), so this makes the test honest rather than breaking it. Guard sweepTerminal against pruning an order whose assigned truck is still docked.",
+    "dependsOn": "8"
+   },
+   {
+    "order": 10,
+    "title": "StockMonitor: deficit-sized manifest, real reorder point, stall timeout",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/stock_monitor_brain.dart"
+    ],
+    "what": "(a) `manifest: 1` (:65) is a hardcoded literal with no relationship to `orderedUnits: reorderUnits` (:57) \u00e2\u20ac\u201d the truck side already loops `for (var i = 0; i < manifest; i++)` (inbound_truck_brain.dart:90-99) and is genuinely multi-pallet capable, but nothing ever passes >1. Size the manifest from the rack's ACTUAL DEFICIT, not from reorderUnits: a naive ceil(reorderUnits/kLoosePerPallet) is a no-op, because reorderUnits defaults to kLoosePerPallet = exactly one pallet. (b) This is a LATENT PERMANENT STALL, not a churn bug: one absorbed pallet credits exactly 48 (putaway_robot_brain.dart:144-145) which happens to equal the default reorderUnits, so isSatisfied fires only by coincidence of two independently-declared constants being equal. Set reorderUnits=96 and progress caps at 48, the Order never satisfies, inFlight() (:40-43) blocks that SKU's trucks forever, and the one truck has already departed and deregistered. (c) Trigger on step 3's configurable reorder point. (d) React to unfulfillable outbound demand for a SKU with no rack stock \u00e2\u20ac\u201d today the monitor is closed over rack contents (:47-52) exactly like the generator, so it cannot even perceive demand for an unstocked SKU. (e) Add an open-order timeout so a departed truck can't wedge a SKU permanently: Order.createdTick (job_board.dart:97) is written at :268 and READ NOWHERE, so no age-based expiry exists today.",
+    "risk": "p3_inbound_loop_test asserts the close path via _lowAnywhere; deficit-sized manifests change the pallet count per truck. Keep the `inFlight` open-Order debounce \u00e2\u20ac\u201d it is what prevents truck churn today.",
+    "dependsOn": "3, 5"
+   },
+   {
+    "order": 11,
+    "title": "InboundTruck: real cargo, arbitrated stepping, seek timeout, truck-adjacent unload",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_truck_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/action_applier.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_robot_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p2_unload_chain_test.dart"
+    ],
+    "what": "Four coupled truck defects. (a) CARGO IS FICTIONAL: the truck has no inventory field (only skuId + int manifest, :34-36) and pickFromTruck (action_applier.dart:104-108) only loads the robot's cargo \u00e2\u20ac\u201d no source read, no decrement, no empty check, void return. Contrast its siblings pickFromRack (:120-133, clamps) and takeFromStage (:144-151, returns false on empty). Add the designed `truckManifestProvider` (Map<truckId,int>) and make pickFromTruck return bool + decrement + refuse when empty; the IR resolves truckId from Job.subjectUnitId. (b) TRUCKS BYPASS THE ARBITER AND DESYNC IT: `_advance` calls bare moveTo (:126-133) with no reservation check, replan, or blocked counter \u00e2\u20ac\u201d unlike all 4 robot brains (identical replan-at-4 / side-step-at-8 shape). Worse, unit_scheduler.dart:47-53 seeds cellReservationProvider with EVERY unit's cell including trucks, and moveTo never updates it \u00e2\u20ac\u201d so a moving truck leaves a phantom reservation on its origin (blocking robots from an empty cell) while its real cell stays unreserved (letting a robot walk into the truck). Switch to tryStep + blocked counter. Same for outbound_truck_brain.dart:114. (c) NO-BAY WEDGE: with no dock cell, _bayCells is empty, perceiveAndDecide returns (:54-56), and the truck sits in seekingBay forever with no timeout \u00e2\u20ac\u201d copy the sibling's `kMaxSeekTicks`/closeOrder(aborted:true)/remove (outbound_truck_brain.dart:31,69-74, the HT-2 fix the inbound side never got). (d) NEAR THE TRUCK: publish the truck's own pos on the unload job (src is currently the bay cell at :93, but the truck parks on _adjacentDriveable OF the bay) so the IR approaches the truck, not the bay \u00e2\u20ac\u201d today both sit on neighbours of the bay and the IR's free-side preference DETERMINISTICALLY skips the truck's cell.",
+    "risk": "BREAKS p2_unload_chain_test \u00e2\u20ac\u201d it mints an unloadTruck job at a dock cell with NO truck registered and passes; the IR unloads a truck that does not exist. Once pickFromTruck checks cargo, that fixture must register a truck (or seed truckManifestProvider). Also note _hasOutstandingUnloads (:120-124) filters kind/subjectUnitId with NO status filter and completeJob only sets status=done (never removes) \u00e2\u20ac\u201d verify the sweeper actually runs, or the truck never departs.",
+    "dependsOn": "5, 10"
+   },
+   {
+    "order": 12,
+    "title": "Landing area: the truck-side buffer (spec 4)",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_robot_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/providers.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/action_applier.dart"
+    ],
+    "what": "There is NO landing concept anywhere today (a repo-wide grep for 'landing' hits one unrelated markdown row). The IR FSM is a SINGLE hop truck\u00e2\u2020\u2019palletStaging: `_findStaging` hard-filters `if (c.type != CellType.palletStaging) continue` (:193) and the drop lands in stagingPalletsProvider. Retarget _findStaging to CellType.landing (step 2) with a palletStaging fallback for legacy layouts, and mint the follow-on putaway job FROM landing. Crucially, spec 4 needs BOTH halves: IR unloads\u00e2\u2020\u2019landing AND OR picks from landing. Today those are two DISJOINT buffers \u00e2\u20ac\u201d IR drops to palletStaging (inbound-only) while OR takes from packStation via outboundStageProvider (outbound-only) \u00e2\u20ac\u201d so no renaming can satisfy the spec; a shared truck-side buffer must actually exist. Reuse stagingPalletsProvider keyed to landing cells rather than adding a third provider.",
+    "risk": "p2_unload_chain_test and p1_putaway_test build grids with palletStaging cells \u00e2\u20ac\u201d the fallback keeps them green. Without the fallback both break.",
+    "dependsOn": "2, 11"
+   },
+   {
+    "order": 13,
+    "title": "Putaway 5.1: cross-dock to outbound staging (the never-ported rule)",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/putaway_robot_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/bay_resource.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p1_putaway_test.dart"
+    ],
+    "what": "`_decideDestination(WarehouseConfig cfg, String sku)` (:226-227) takes only the static grid and a SKU \u00e2\u20ac\u201d it is STRUCTURALLY INCAPABLE of reading an Order, which is why rule 5.1 was silently dropped in the port despite the doc comments at :4, :53 and :224 (and p1_putaway_test.dart:2) all claiming '5.1-5.4'. Change the signature to take BrainContext, add rule 5.1 (open outbound order for this SKU with unreserved demand \u00e2\u2020\u2019 free outboundStage cell, mirroring pick_robot_brain.dart:290-294 _findStage), and branch `_PR.dropping` (:134-148) to applier.stageOutbound instead of dropToRack. Add `outboundDemandReservationProvider` (Map<skuId,int>) alongside rackReservationProvider in bay_resource.dart so putaway-5.1 and PickRobot cannot both serve the same line (SC-5). Call the DEAD `Order.divert()` hook (job_board.dart:128-131 \u00e2\u20ac\u201d defined, feeds remainingUnits, zero callers) and credit the inbound line via Job.divertedFromInboundLineId (step 5). Fix the four stale doc comments. Port the legacy twin's logic from pallet_putaway_controller.dart:407-419 but NOT its trigger: _hasOrderPending (:458) inspects static config.truckSpawns cargo, not real orders \u00e2\u20ac\u201d its own comment concedes 'in real implementation this would query backend orders'.",
+    "risk": "Medium. The legacy PalletPutawayController is NOT ticked (robot_scout_simulation.dart:378-386 \u00e2\u20ac\u201d it stays instantiated only for manual D-pad mode), so this is a genuine port, not a refactor. The SC-5 double-serve it guards against is currently unreachable precisely because 5.1 doesn't exist \u00e2\u20ac\u201d the reservation provider must land WITH the rule, not after.",
+    "dependsOn": "5, 6, 12"
+   },
+   {
+    "order": 14,
+    "title": "PickRobot: honour job.qtyUnits, order-affine staging, zone binding, nearest-first",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart"
+    ],
+    "what": "(a) QUANTITY \u00e2\u20ac\u201d the hard blocker for spec 1. Line :136 hardcodes `pickFromRack(this, _rack!, _sku, 1)` and :177 completes the job unconditionally; job.qtyUnits (job_board.dart:186) is NEVER READ by this brain (it only WRITES it at :175 for the packAndLoad handoff). Loop the FSM until qtyUnits is satisfied (or pick min(remaining, faceQty) per trip). This is non-optional before step 7: because completeJob passes no progressUnits, job_board.dart:392 won't advance the Order, so a 144-unit order does not under-deliver \u00e2\u20ac\u201d it WEDGES at 48/144 with no job to mint the remainder, the truck holding its bay forever on isSatisfied, and wipCap blocking every future order. The releaseOrFail watchdog cannot rescue it (the job already settled `done`). (b) GROUPING: `_findStage` (:290-301) filters only on type/free/reserved \u00e2\u20ac\u201d orderId is never consulted despite _orderId being held at :39. Prefer a cell already holding the same orderId, then nearest to order.shipBay. (c) ZONES (spec 5a/5b/5c): bind config.zoneForCell (warehouse_config.dart:539-551) in _findSource so a picker's handledUom is constrained to its PickZone. The three pick areas ALREADY exist as PickZoneType.pallet/casePick/loosePick + PickZoneDef, are painted by the template factory (:416/428/440), are paintable in the creator, and are consumed by exactly 3 UI sites (two tooltips + a render tint) \u00e2\u20ac\u201d zero hits across lib/application. Bind the existing zones; do NOT resurrect looseStaging/caseStaging CellTypes, which would duplicate this model. (d) SHORTEST PATH (spec 8): legs are A*-optimal but ENDPOINT SELECTION is not \u00e2\u20ac\u201d _findSource (:277-288) and _findStage both return the first match in cell order and don't even take `pos` as a parameter. Rank candidates by path length.",
+    "risk": "Highest-value single step; gates step 7. Preserve the existing AC-4/F2 ordering invariant (secure stage + path BEFORE consuming the idem key or decrementing the rack, :114-139) \u00e2\u20ac\u201d a multi-trip loop must re-establish it per trip, and the idemKey must become per-trip (`:L$i:$trip`) or the second trip's rack decrement is rejected by consumeIdem as a duplicate. Keep the reserved-vs-no-stock distinction at :74-78 (release vs releaseOrFail).",
+    "dependsOn": "5, 6"
+   },
+   {
+    "order": 15,
+    "title": "OutboundRobot: wait for the order's group, load into the pooled truck",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_robot_brain.dart"
+    ],
+    "what": "The claim gate is currently just `if (stage == null || shipBay == null) continue;` (:41-69) \u00e2\u20ac\u201d no group-completeness wait, so it hauls each staged item individually to the truck the instant it appears. Gate on Order.isFullyStaged (step 5) so all lines are consolidated before loading \u00e2\u20ac\u201d this is spec 2's 'GROUPED TOGETHER per order'. Load into the pooled truck's fill counter (step 8) rather than closing the order (step 9). Per spec 4, the OR should source from the landing/shipping location (step 12).",
+    "risk": "Low. Note the grouping failure is currently UNREACHABLE (one UOM-unit per order \u00e2\u2021\u2019 one stage cell \u00e2\u2021\u2019 grouping vacuously satisfied); it becomes live the moment step 7's multi-line orders land, which is why this must precede/accompany step 7.",
+    "dependsOn": "5, 6, 8, 12, 14"
+   },
+   {
+    "order": 16,
+    "title": "Charging: mid-job preemption, arbitrated charge route, nearest reachable charger",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_brain.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_scheduler.dart"
+    ],
+    "what": "Spec 9's literal behaviour IS implemented for IDLE robots (CAS charger arbiter, A* route, 20/60 hysteresis, offline recovery \u00e2\u20ac\u201d p5_charging_test passes). Three gaps remain. (a) MID-JOB: startChargeIfNeeded bails on `!isIdle` (:137), and isIdle == (currentJobId == null && lifecycle == idle) (:91), so a robot that goes low WHILE working never diverts \u00e2\u20ac\u201d it works to battery 0 and is force-dropped offline (unit_scheduler.dart:40-42), aborting its Job and shedding cargo. Drop the isIdle gate and add suspend+resume: use plain `release` (not releaseOrFail) so a charge break doesn't burn an attempt toward the kMaxJobAttempts=8 abort. The in-file comment at :107 concedes this. (b) ARBITER BYPASS: chargeStep advances with bare `moveTo` (:162) while every other robot movement uses tryStep \u00e2\u20ac\u201d cellReservationProvider is read in exactly ONE place in the codebase (action_applier.dart:48). A charge-seeking robot walks through reserved cells AND leaves a phantom reservation behind. Switch to tryStep and only advance _chargeIdx on success (it currently increments unconditionally at :161, so a naive fix desyncs the index from the true position). (c) CHARGER CHOICE: _chargerCells (:183-186) + claimFirstFree take the first charger in cell order, not the nearest. Worse, the A* path is computed AFTER the claim (:143-147) \u00e2\u20ac\u201d if that charger is unreachable the code releases and returns false, and next tick claimFirstFree deterministically returns the SAME unreachable charger: a genuine livelock. Score candidates by distance and fall through to the next on failure. Also revisit the low-battery patrol freeze (:251), which leaves a robot that can't get a charger neither charging nor patrolling.",
+    "risk": "p5_charging_test.dart covers only the idle case and should stay green. Mid-job preemption interacts with cargo: define whether the robot parks its cargo or carries it to the charger before touching the FSM.",
+    "dependsOn": "17"
+   },
+   {
+    "order": 17,
+    "title": "pathfinding: make `walkable` required; estimateTicks must forward it",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/pathfinding.dart"
+    ],
+    "what": "findPath's default is `walkable ?? (_) => true` (:107) \u00e2\u20ac\u201d when a caller omits the predicate, EVERY cell (racks, obstacles, trees) is walkable and the returned 'shortest path' is a Manhattan line through solid inventory. The class doc at :99 contradicts the code, claiming the default is isCellWalkable (which exists at grid_constants.dart:52, is never called, and takes a CellType not a coordinate \u00e2\u20ac\u201d it cannot be that default). estimateTicks (:178-182) is exactly such a caller: it forwards `occupied` but never `walkable`, so any ETA is computed against a phantom empty warehouse. Make `walkable` required \u00e2\u20ac\u201d all 8 existing call sites already pass it, so this compiles clean \u00e2\u20ac\u201d and have estimateTicks accept/forward it.",
+    "risk": "None today (estimateTicks has zero callers; all operational brains pass a predicate). Do this BEFORE step 16, which introduces the first real estimateTicks consumer (battery-feasibility on claim) \u00e2\u20ac\u201d otherwise that gate is optimistic-by-construction on arrival.",
+    "dependsOn": "none"
+   },
+   {
+    "order": 18,
+    "title": "sim_bootstrap: heterogeneous picker UOMs, guaranteed role coverage, distinct yards",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/warehouse_readiness.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart"
+    ],
+    "what": "(a) THREE PICKERS, NOT N CLONES (spec 6+7): `handledUom` is passed exactly once in all of lib/ (:66), using one warehouse-wide `_warehousePickUom(config)` (:98-110). The per-UOM MECHANISM is already correct and complete (PickRobotBrain.handledUom, _sourceType, the SC-9 UOM claim gate) \u00e2\u20ac\u201d only the WIRING is missing. Turn `roles` (:48-53) into (role, uom) slots so a pallet + case + loose picker coexist, and delete _warehousePickUom. Note handledUom is `final` and _sourceType derives from it, so retarget should bind UOM per-CLAIM from job.requiredUom rather than by mutating the field \u00e2\u20ac\u201d otherwise a depleting first rack strands every picker on the bootstrap UOM (the bootstrap scan runs ONCE, the generator's scan runs per-tick; same cell order, different clock). (b) ROLE COVERAGE: `roles[i % roles.length]` (:62) means 3 robots \u00e2\u2021\u2019 no OutboundRobot at all and nothing ever loads the truck; matchesRole is a hard equality gate with no adoption fallback. Guarantee \u00e2\u2030\u00a51 of each of the 4 roles before round-robining the remainder. UPGRADE the EXISTING advisory detection at warehouse_readiness.dart:60-66 (which already names this exact rule and is unit-tested and wired to a snackbar at floor_screen.dart:356-372) to a blocker \u00e2\u20ac\u201d do NOT write a second copy. (c) The `_ =>` catch-all (:67) silently turns any future role into an outbound robot; it is currently load-bearing for compilation because roles[] is typed as the 11-value UnitRole, so make it exhaustive via a dedicated 4-value ops-role enum or an explicit throw. (d) Distinct inbound/outbound truck spawn + exit: one shared `spawn` (:74-77) goes to both system brains and the exit defaults to `(row: pos.row, col: 0)`, so all trucks stack on one yard cell. (e) Dead roles: UnitRole.bayAllocator and .recovery have no brain and are never registered (recovery is done in-place by offlineRecoverStep, so the 'recovery tow' promised at unit_brain.dart:44 can never arrive); ScoutBrain exists but is never imported. Delete or register.",
+    "risk": "MUST LAND WITH STEP 7 (see summary constraint 2). app_bootstrap_test passes 4 robots so coverage stays satisfied. Heterogeneous pickers ALONE strand the two non-matching pickers forever (the generator only mints the first stocked rack's UOM); mixed demand ALONE mints unclaimable jobs. Neither half is independently shippable.",
+    "dependsOn": "14"
+   },
+   {
+    "order": 19,
+    "title": "Test suite: rewrite the 6 broken, add coverage for the newly-reachable paths",
+    "files": [
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/regression_putaway_capacity_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p2_unload_chain_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_outbound_loop_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_outbound_loose_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p4_pick_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/regression_multipicker_test.dart",
+     "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/p1_putaway_test.dart"
+    ],
+    "what": "REWRITE the 6 that encode reversed behaviour (each as part of the step that breaks it, not deferred to here): regression_putaway_capacity (step 3), p2_unload_chain (step 11), p4_outbound_loop + p4_outbound_loose (steps 7/8), p4_pick + regression_multipicker (step 6). NEW coverage for paths that were previously unreachable dead code \u00e2\u20ac\u201d the existing suite is green precisely BECAUSE it only exercises 5.4, one-unit orders, and idle charging: (1) determinism \u00e2\u20ac\u201d same seed \u00e2\u2021\u2019 identical order stream (the JEPA-eval guarantee); (2) 5.2 break-to-loose with rackLoose maxQuantity>=48 and 5.3 break-to-case with rackCase>=12 \u00e2\u20ac\u201d note `rackCase` appears in ZERO test files repo-wide today; (3) 5.1 cross-dock with an open outbound order, asserting Order.divert() is credited and the line is not double-served; (4) truck fill: two orders share one truck, departs on capacity, and the dwell timeout releases a half-full truck; (5) landing hop: truck\u00e2\u2020\u2019landing\u00e2\u2020\u2019putaway, and OR sourcing from landing; (6) multi-unit pick: a 144-unit order fully delivers (the current deadlock); (7) truck cargo conservation: an aborted IR pick doesn't destroy a pallet, and an empty truck refuses; (8) no-bay inbound timeout; (9) mid-job charge preemption resumes the job. Fix the doc comment at p1_putaway_test.dart:2 (claims '5.1-5.4' coverage for a rule that was never ported).",
+    "risk": "None \u00e2\u20ac\u201d this is the safety net. Land each rewrite inside its breaking step so the suite is never red between steps.",
+    "dependsOn": "3, 6, 7, 8, 11, 13, 14, 16"
+   }
+  ]
+ },
+ "confirmedGapCount": 49,
+ "refutedGapCount": 4,
+ "confirmedGaps": [
+  {
+   "area": "inbound",
+   "specPoint": "4 (IR: unload -> LANDING AREA)",
+   "severity": "blocker",
+   "missing": "There is NO 'landing area' concept anywhere in the simulator \u00e2\u20ac\u201d not as a CellType, not as a provider, not as a brain state. A case-insensitive grep for 'landing' across the whole WarehouseSimulator tree returns exactly one hit, in an unrelated markdown table (ADVERSARIAL_REVIEW.md:63). Unloaded goods drop STRAIGHT to palletStaging: `_findStaging` hard-filters `if (c.type != CellType.palletStaging) continue` (inbound_robot_brain.dart:193), and the drop applies to stagingPalletsProvider (inbound_robot_brain.dart:112 -> action_applier.dart:111-116). There is no distinct truck-side buffer that goods land in before being staged/putaway, and therefore nothing for the outbound robot (spec 4 OR) to pick 'from the landing area' either.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart (add a `landing` CellType + default maxQuantity + isWalkable/paint handling), c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_robot_brain.dart (`_findStaging` at :190-201 must target landing, and mint the follow-on job from landing), plus the renderer/creator (screens/warehouse_creator_screen.dart, screens/floor_screen.dart) to let the layout declare landing cells"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "3 (stock arrives by inbound truck) / 4 (IR unload)",
+   "severity": "major",
+   "missing": "MANIFEST IS HARDCODED TO EXACTLY ONE PALLET. StockMonitorBrain always passes `manifest: 1` (stock_monitor_brain.dart:66); nothing anywhere passes a larger value. The truck side is genuinely multi-pallet-capable \u00e2\u20ac\u201d it loops `for (var i = 0; i < manifest; i++)` minting one unloadTruck job per pallet (inbound_truck_brain.dart:90-99) and waits for all of them \u00e2\u20ac\u201d but that capability is never exercised. Consequence for 'continuous, no hiccups': each replenish is a full spawn -> claim bay -> drive -> dock -> unload 1 pallet -> depart -> despawn cycle, and if the rack is still <50% the very next tick mints another order and another whole truck. Truck churn, not a manifest.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/stock_monitor_brain.dart:60-68 (compute manifest from reorderUnits instead of the literal 1)"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "3 (inbound triggers automatically until stock is restored)",
+   "severity": "major",
+   "missing": "LATENT PERMANENT STALL: manifest is not derived from reorderUnits, so the loop only terminates by coincidence of the default. `orderedUnits = reorderUnits` defaults to kLoosePerPallet = 48 (stock_monitor_brain.dart:23, 57) and one fully-absorbed pallet credits exactly 48 (putaway_robot_brain.dart:144-145: `absorbed * (kLoosePerPallet ~/ _dropAmount)`), which is the ONLY reason `isSatisfied` fires (job_board.dart:392-394). `reorderUnits` is a public constructor parameter (stock_monitor_brain.dart:23); set it to anything > 48 (e.g. 96) and progress caps at 48, the order never satisfies, and if any rack cell of that SKU is still low the `_lowAnywhere` fallback never closes it either (stock_monitor_brain.dart:77, 88-93). The order then sits open forever, `inFlight()` blocks every future truck for that SKU (stock_monitor_brain.dart:40-43, 52), and the one truck sent has already departed and removed itself from the registry (inbound_truck_brain.dart:112-116). That SKU never replenishes again.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/stock_monitor_brain.dart:60-68 \u00e2\u20ac\u201d manifest must be ceil(reorderUnits / kLoosePerPallet); optionally an open-order timeout so a departed truck cannot leave an order wedged"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "3 (threshold / safety stock)",
+   "severity": "major",
+   "missing": "THE 50% THRESHOLD IS BAKED INTO THE MODEL AND IS EFFECTIVELY 'EMPTY' FOR CASE/LOOSE RACKS. `needsReplenishment` is a hardcoded `quantity < maxQuantity * 0.5` getter on the cell (warehouse_config.dart:302-303) shared with the UI; there is no per-SKU or per-monitor reorder point (`reorderUnits` sets the ORDER SIZE only, not the trigger point). With the default capacities rackCase = 2 and rackLoose = 2 (warehouse_config.dart:312-314), the trigger is `quantity < 1.0` \u00e2\u20ac\u201d i.e. it only fires once the case/loose rack is at ZERO. So case and loose pick faces must be completely stocked out before any inbound is raised, and stay out for the whole spawn->dock->unload->putaway latency. That is a guaranteed 'hiccup' for the case/loose outbound paths (spec 6 and 7), not continuous supply.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart:302-303 (make the reorder point configurable / non-zero for small-capacity racks) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/stock_monitor_brain.dart:50 (trigger on it)"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "4 (IR takes inventory OFF the inbound truck)",
+   "severity": "major",
+   "missing": "TRUCK CARGO IS FICTIONAL \u00e2\u20ac\u201d nothing is ever taken 'off the truck'. `pickFromTruck` only loads the robot's cargo provider; it does not decrement any truck-held inventory, because InboundTruckBrain has no inventory field at all \u00e2\u20ac\u201d only `skuId` and an int `manifest` (inbound_truck_brain.dart:34-36), and `manifest` is consumed purely as a job-mint count (inbound_truck_brain.dart:90-99). See action_applier.dart:104-108: `void pickFromTruck(UnitBrain unit, String skuId, {String truckId = 'TRUCK'}) { ref.read(robotCargoProvider.notifier).loadPallet(unit.id, PalletData(skuId: skuId, truckId: truckId)); }`. There is no conservation check, so an IR that picks and then aborts (inbound_robot_brain.dart:82 picks, :92-95 aborts, :165 `clearCargo`) silently destroys that pallet with no restock to the truck \u00e2\u20ac\u201d the delivery is simply lost.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_truck_brain.dart (give the truck a real decrementing pallet count) + c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/action_applier.dart:104-108 (make pickFromTruck decrement it and fail when empty)"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "4 (robots working NEAR TRUCKS)",
+   "severity": "minor",
+   "missing": "THE IR IS ADJACENT TO THE BAY CELL, NOT TO THE TRUCK. The unload job's src is the bay cell (`src: _bay`, inbound_truck_brain.dart:93), but the truck does NOT park on the bay \u00e2\u20ac\u201d it parks on `_adjacentDriveable(...)` of the bay (inbound_truck_brain.dart:59, 168-176). The IR independently paths to `_adjacentWalkable(...)` of that same bay cell (inbound_robot_brain.dart:44-48). Both are neighbours of the bay, so they can sit on OPPOSITE sides of it and never be adjacent to each other; the IR never reads the truck's position and `pickFromTruck` never verifies the truck is there (action_applier.dart:104-108). 'Near the truck' currently holds only by the bay acting as a proxy. (Timing is safe \u00e2\u20ac\u201d jobs are minted only once docked, inbound_truck_brain.dart:87-99 \u00e2\u20ac\u201d so the IR cannot unload a truck that has not arrived.)",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_truck_brain.dart:87-99 (publish the truck's own pos on the job, as OutboundTruckBrain does with shipBay) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_robot_brain.dart:44-48 (approach the truck cell)"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "3 / 8 (stock arrives with no hiccups; shortest path)",
+   "severity": "minor",
+   "missing": "TRUCKS IGNORE MOVEMENT ARBITRATION AND ALL SPAWN ON ONE CELL. InboundTruckBrain `_advance` calls `applier.moveTo(this, _path[_pathIdx])` unconditionally with no reservation check, no blocked counter and no replan (inbound_truck_brain.dart:126-133) \u00e2\u20ac\u201d contrast the IR's `_advance`, which uses `applier.tryStep` with replan-at-4 and side-step-at-8 (inbound_robot_brain.dart:131-162). A truck therefore drives straight over robots and other trucks. Compounding it, every truck \u00e2\u20ac\u201d inbound AND outbound \u00e2\u20ac\u201d spawns at the identical cell, the first road cell (sim_bootstrap.dart:74-77 pass one shared `spawn` to both StockMonitorBrain and OutboundOrderGeneratorBrain; truckSpawnCell, sim_bootstrap.dart:82-92), and the default exit is `(row: pos.row, col: 0)` (inbound_truck_brain.dart:104), so trucks stack on the yard.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_truck_brain.dart:126-133 (arbitrated stepping) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart:74-92 (distinct inbound/outbound yard spawn + exit cells)"
+  },
+  {
+   "area": "inbound",
+   "specPoint": "3 (inbound triggers automatically)",
+   "severity": "minor",
+   "missing": "NO BAY => THE INBOUND LOOP WEDGES SILENTLY, WITH NO TIMEOUT. If the layout has no dock/inbound cell, `_bayCells` returns empty and `perceiveAndDecide` just returns (inbound_truck_brain.dart:54-56); the truck sits in seekingBay forever (inbound_truck_brain.dart:78-79) and is never removed. Its order stays open, so `inFlight()` blocks that SKU permanently (stock_monitor_brain.dart:40-43, 52) unless the `_lowAnywhere` fallback happens to clear it (stock_monitor_brain.dart:77). Nothing aborts a truck that can never dock, and there is no diagnostic. (The unreachable-bay case is handled \u00e2\u20ac\u201d it releases and retries each tick, inbound_truck_brain.dart:63-66.)",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_truck_brain.dart:51-72 (abort/despawn + abort the order after N ticks with no claimable bay) or a layout validation gate in c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random SKU)",
+   "severity": "blocker",
+   "missing": "SKU selection is fully DETERMINISTIC, not random. `_firstStocked` returns the FIRST stocked rack found in `cfg.cells` iteration order and the brain uses `stocked.sku` unconditionally (outbound_order_generator_brain.dart:44-47, 87-95). There is no sampling, no SKU catalog, no weighting. The file header states this outright: 'Selection is deterministic (first stocked SKU) so runs are reproducible for the JEPA eval; a seeded-random demand pattern can layer on top later' (outbound_order_generator_brain.dart:5-7). No `dart:math` import and no Random/seed field exists anywhere in the file (imports at :10-13; fields at :24-30).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart \u00e2\u20ac\u201d add a seeded Random field + a stocked-SKU sampler to replace `_firstStocked`"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random UOM)",
+   "severity": "blocker",
+   "missing": "UOM is never CHOSEN \u00e2\u20ac\u201d it is inherited from whatever rack type happened to be scanned first: `final uom = rackUomOf(c.type); if (uom != null) return (sku: c.skuId!, uom: uom);` (outbound_order_generator_brain.dart:91-92), then consumed as `stocked.uom` at :53 and :64. On a warehouse painted with the rackLoose creator default (acknowledged at :83-86), EVERY order is a loose order forever. The demand UOM is a property of the storage layout, not of demand.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart \u00e2\u20ac\u201d UOM must be sampled per order line independently of rack type; sourcing/decomposition then resolves how to satisfy it"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random quantity)",
+   "severity": "blocker",
+   "missing": "Quantity is not random and is not even a free parameter. Order size is hard-wired to exactly ONE UOM-unit: `final units = stocked.uom.looseUnits;` (outbound_order_generator_brain.dart:53) \u00e2\u2020\u2019 always 1, 4, or 48 loose-equivalent, decided solely by the rack type. Orders are never 2 pallets or 7 cases. The comment at :48-52 documents this as intentional-for-now: 'One UOM-unit per order for now: the pipeline mints exactly one pick Job and ships one unit, so the order must be sized to what a single pick\u00e2\u2020\u2019ship cycle delivers'.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:53"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random quantity)",
+   "severity": "major",
+   "missing": "DEAD PARAMETER: the constructor exposes `orderUnits = kLoosePerPallet` (=48) at outbound_order_generator_brain.dart:20 and stores it as a field at :28, but `orderUnits` is NEVER READ anywhere in the class \u00e2\u20ac\u201d `perceiveAndDecide` uses `stocked.uom.looseUnits` instead (:53). Any caller configuring `orderUnits` is silently ignored, which will mask the sizing bug during wiring.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:20,28 \u00e2\u20ac\u201d either honour the field or delete it"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random timing)",
+   "severity": "blocker",
+   "missing": "There is NO timing model at all \u00e2\u20ac\u201d no inter-arrival delay, no next-due tick, no jitter, no cooldown field. `perceiveAndDecide` runs every tick and mints immediately whenever `openOutbound < wipCap` (outbound_order_generator_brain.dart:33-42, 55). `ctx.tick` is read ONLY to stamp `createdTick` on the Order (:59) \u00e2\u20ac\u201d it never gates emission. Effective behaviour: orders arrive back-to-back at max rate, one at a time, the instant the previous one closes. That is a lock-step conveyor, not random demand.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:33-42 \u00e2\u20ac\u201d add a `_nextDueTick` field + seeded inter-arrival draw"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (decomposition into multiple pick Jobs across UOMs)",
+   "severity": "blocker",
+   "missing": "An order decomposes into EXACTLY ONE Job, never several. There is a single unconditional `board.mintJobOf(...)` call with no loop and no per-UOM branching (outbound_order_generator_brain.dart:61-69). The Job's `requiredUom: stocked.uom` (:64) is the one UOM the whole order will ever touch. There is no pallet\u00e2\u2020\u2019case\u00e2\u2020\u2019loose split, no 'take 1 pallet + 3 cases + 2 loose' composition, despite the loose-equivalent algebra existing precisely to make that composable (job_board.dart:12, 24-34). The code names the missing feature: 'Larger multi-unit orders would wedge the WIP slot until multi-unit explosion is wired (AC-6)' (outbound_order_generator_brain.dart:51-52).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:61-69 \u00e2\u20ac\u201d replace the single mint with a per-line explosion loop"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (order lines grouped together)",
+   "severity": "blocker",
+   "missing": "The multi-line CONCEPT exists in the model but is INERT \u00e2\u20ac\u201d the generator never uses it. `mintOrder` is called WITHOUT the `lines:` argument (outbound_order_generator_brain.dart:55-60), so `lines` falls back to `const []` (job_board.dart:88) and every Order ships with an EMPTY lines list. `OrderLine` (job_board.dart:67-75) is therefore constructed nowhere in these two files. The vestigial idemKey `'${order.id}:L0:0'` (outbound_order_generator_brain.dart:66) encodes a line-index/split-index scheme ('L0', ':0') for a multi-line design that was planned but never built.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:55-60 \u00e2\u20ac\u201d pass real `lines:`; ids should follow the existing L<i>:<n> idemKey convention"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (grouped together per order)",
+   "severity": "blocker",
+   "missing": "NO PER-LINE PROGRESS TRACKING exists, so even once lines are emitted the board cannot tell whether an order is fully grouped. `OrderLine` is immutable-by-shape with only `{id, uom, units}` and has NO progress/fulfilled/jobId/staged field (job_board.dart:67-75). Progress lives solely on the Order as one scalar `_progressUnits` (job_board.dart:106-108) advanced by `completeJob(progressUnits:)` (job_board.dart:386-397). `Order.isSatisfied` is a pure loose-equivalent total check (job_board.dart:120) \u00e2\u20ac\u201d 48 loose picked one-at-a-time satisfies an order for 1 pallet. Nothing can answer 'are all lines of ORD-x staged at the same place yet?'.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart:67-75 (add per-line progress) and :386-397 (attribute completion to a line, not just the Order)"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (grouped together per order)",
+   "severity": "major",
+   "missing": "There is NO staging/consolidation state on the Order. `Order` carries only `shipBay` (job_board.dart:101-104) \u00e2\u20ac\u201d the truck's dock cell. There is no stagingCells / consolidationLane / stagedUnits field, and no 'all lines present, ready to load' predicate. Grouping inventory together per order in the shipping area is unrepresentable in the current model.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart:80-132 (Order class)"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (one order = one SKU)",
+   "severity": "major",
+   "missing": "An Order is hard-bound to a SINGLE SKU: `final String skuId;` (job_board.dart:84), required by `mintOrder` (:259) and passed as `skuId: sku` (outbound_order_generator_brain.dart:57). `OrderLine` carries `{id, uom, units}` but NO skuId (job_board.dart:68-74), so lines cannot vary SKU either. A multi-SKU customer order \u00e2\u20ac\u201d the normal case for 'grouped together per order' \u00e2\u20ac\u201d cannot be expressed.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart:84 and :68-74 \u00e2\u20ac\u201d move skuId onto OrderLine"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (truck departs when full)",
+   "severity": "blocker",
+   "missing": "NO FILL-LEVEL CONCEPT exists in either file. Neither `Order` (job_board.dart:80-132) nor `Job` (job_board.dart:152-211) has capacity/fillUnits/isFull. Instead one truck is spawned per order at emission time (outbound_order_generator_brain.dart:70-76), so 'full' degenerates to 'one order's single unit'. With wipCap=1 (:19) the system is strictly serialized: one order \u00e2\u2020\u2019 one Job \u00e2\u2020\u2019 one truck \u00e2\u2020\u2019 depart \u00e2\u2020\u2019 next order. Multiple orders never share a truck, and a truck never waits to fill.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:70-76 (stop spawning 1:1) + outbound_truck_brain.dart (capacity/fill gate) + job_board.dart Order (assigned-truck field)"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 & 2 (continuous flow with little or no hiccups)",
+   "severity": "major",
+   "missing": "wipCap defaults to 1 (outbound_order_generator_brain.dart:19), which by construction prevents continuous concurrent outbound flow \u00e2\u20ac\u201d the pipeline drains to empty between orders. The spec's 'complete, continuous inventory in->out automation' needs several orders in flight so pallet/case/loose pickers and both truck robots work in parallel.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:19 \u00e2\u20ac\u201d raise cap once multi-line explosion (AC-6) lands; the comment at :51-52 notes larger orders currently 'wedge the WIP slot'"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "1 (random SKU)",
+   "severity": "major",
+   "missing": "The generator can only ever demand a SKU THAT IS ALREADY STOCKED \u00e2\u20ac\u201d `_firstStocked` returns null and the brain returns early when no rack holds stock (outbound_order_generator_brain.dart:44-45, 87-95). Real random demand must be able to request an out-of-stock SKU, which is exactly the trigger the inbound side (spec point 3) needs to react to. Today outbound demand can never create a shortage it didn't already have inventory for.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:44-45, 87-95 \u00e2\u20ac\u201d sample from a SKU catalog, not from live rack contents"
+  },
+  {
+   "area": "outbound-generation",
+   "specPoint": "2 (routing by UOM)",
+   "severity": "minor",
+   "missing": "No cross-dock / staging routing decision is made at generation time. The generator always mints `JobKind.pickToStage` for `UnitRole.pickRobot` (outbound_order_generator_brain.dart:62-63) regardless of whether the order could be satisfied from an arriving pallet. `Order.divert()`/`divertedUnits` exist to account for that path (job_board.dart:110-113, 128-131) but nothing in the generator ever marks an order as cross-dock-eligible, so the accounting hook has no producer on this side.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:61-69 (mark eligibility) \u00e2\u20ac\u201d consumer lives in the pallet-pick/putaway brains (spec point 5d)"
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "6 and 7 (case pick robot, loose pick robot as distinct robots)",
+   "severity": "blocker",
+   "missing": "There is NO pick robot per UOM \u00e2\u20ac\u201d every pick robot in the sim gets the SAME handledUom. sim_bootstrap.dart:58 computes a single warehouse-wide `pickUom` and line 66 passes that identical value to every PickRobotBrain constructed in the loop at 59-71. The roles list (sim_bootstrap.dart:48-53) has one `UnitRole.pickRobot` entry, not three. So a warehouse never simultaneously has a pallet picker, a case picker and a loose picker: it has N clones of one UOM.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart (lines 48-53 roles list, 58 single pickUom, 65-66 construction) \u00e2\u20ac\u201d assign handledUom per-robot, e.g. cycle UomKind.values across picker slots instead of one _warehousePickUom result."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "6 and 7 (several pick robots serving DIFFERENT UOMs of the SAME order concurrently)",
+   "severity": "blocker",
+   "missing": "Concurrent multi-UOM service of one order is impossible today, for two independent reasons. (a) All pickers share one UOM (gap above), so no picker exists for the other two UOMs. (b) An Order is single-SKU, single-UOM, single-job by construction: outbound_order_generator_brain.dart:53 sets `final units = stocked.uom.looseUnits` and 61-69 mints exactly ONE JobKind.pickToStage with one `requiredUom`. The comment at outbound_order_generator_brain.dart:48-52 concedes 'the pipeline mints exactly one pick Job and ships one unit\u00e2\u20ac\u00a6 Larger multi-unit orders would wedge the WIP slot until multi-unit explosion is wired (AC-6)'. There is no order-line / UOM-decomposition model anywhere. Even for the same UOM, the CAS claim (job_board.dart:319-323) over a single job means exactly one picker per order.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart (53, 61-69) must mint one pickToStage job per UOM line; c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart may need a per-line Order model (Order at ~109-132 tracks one aggregate counter)."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "5(a)(b)(c) \u00e2\u20ac\u201d the three PICK AREAS (pallet pick area, case pick area, loose pick area)",
+   "severity": "blocker",
+   "missing": "The three pick areas have NO runtime meaning in the pick flow. pick_robot_brain.dart never references CellType.palletStaging, caseStaging or looseStaging \u00e2\u20ac\u201d its single grep hit for any staging/pack cell is `CellType.packStation` at pick_robot_brain.dart:294. Pickers neither source from a pick area nor deliver to one. Worse, two of the three cell types are dead in the model: warehouse_config.dart:60-61 labels looseStaging and caseStaging as 'Staging (legacy)' with the comment 'not in palette', so they cannot even be painted (warehouse_creator_screen.dart:34-35 offers only packStation and palletStaging).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart (60-62 labels, 100-102 colours, add to palette), c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/warehouse_template_factory.dart (243, 454-457 paint the three areas), c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart (_sourceType 48-52 and _findStage 290-301)."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "2 (inventory GROUPED TOGETHER per order in the shipping area) as it lands in the pick flow",
+   "severity": "major",
+   "missing": "The picker drops each unit at the FIRST free pack cell with no regard for which order it belongs to: `_findStage` (pick_robot_brain.dart:290-301) filters only on type==packStation, `held.isFree(...)` and not-reserved \u00e2\u20ac\u201d orderId is never consulted, despite `_orderId` being held at pick_robot_brain.dart:39. The stage store cannot express grouping either: OutboundStageNotifier.place stores only a SKU string (outbound_stage.dart:21-23, map is Map<String,String> of cellKey\u00e2\u2020\u2019skuId). So units of one order scatter across arbitrary pack cells and nothing can reconstitute the order.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/outbound_stage.dart (14-35 \u00e2\u20ac\u201d carry orderId, not just skuId) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart (_findStage 290-301 \u00e2\u20ac\u201d prefer cells already holding the same order; stage drop at 160)."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "1 (random quantity) + 6/7 (pick the ordered quantity)",
+   "severity": "major",
+   "missing": "The picker IGNORES the job's quantity. It always pulls exactly ONE unit \u00e2\u20ac\u201d `applier.pickFromRack(this, _rack!, _sku, 1)` at pick_robot_brain.dart:136 (hardcoded 1) \u00e2\u20ac\u201d stages that one unit and immediately calls `ctx.board.completeJob(_jobId!)` at pick_robot_brain.dart:177. `job.qtyUnits` (job_board.dart:186) is never read by this brain. This is only non-broken today because the generator sizes every order to exactly one UOM unit (outbound_order_generator_brain.dart:53). The moment quantity is randomised per spec 1, a 3-pallet order (qtyUnits=144) is 'completed' after a single 48-unit pallet and under-delivers.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart (136 hardcoded qty 1, 167-176 packAndLoad qtyUnits, 177 premature completeJob) \u00e2\u20ac\u201d either loop the FSM until job.qtyUnits is satisfied, or mint one job per unit in outbound_order_generator_brain.dart."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "6 and 7 (continuous flow with little or no hiccups)",
+   "severity": "major",
+   "missing": "handledUom is `final` (pick_robot_brain.dart:31) and set once at construction \u00e2\u20ac\u201d a picker can never retarget to another UOM at runtime. Combined with `_warehousePickUom`'s 'first stocked rack in CELL ORDER' rule (sim_bootstrap.dart:98-110), a mixed warehouse (rackPallet + rackCase + rackLoose all stocked) locks 100% of pickers onto whichever rack type appears first in cell order. Any pickToStage job of another UOM is then permanently unclaimable because of the hard gate at job_board.dart:208 \u00e2\u20ac\u201d the outbound loop wedges. The two files agree by construction only because BOTH scan cells in the same order (sim_bootstrap.dart:96-97 comment); that coupling is coincidental, not enforced.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart (98-110 _warehousePickUom) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart (31 \u00e2\u20ac\u201d make handledUom mutable or claim per-job UOM)."
+  },
+  {
+   "area": "pick-flow",
+   "specPoint": "8 (robots always take the SHORTEST PATH from source to destination)",
+   "severity": "minor",
+   "missing": "Path legs are A*-optimal, but the SOURCE and DESTINATION selections are not nearest-first: `_findSource` (pick_robot_brain.dart:277-288) returns the first matching rack face in cell-iteration order and `_findStage` (290-301) returns the first free packStation in cell order \u00e2\u20ac\u201d neither compares distance from the robot's current pos. So the robot walks the shortest path to a potentially far-from-optimal face/stage.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart (_findSource 277-288, _findStage 290-301) \u00e2\u20ac\u201d rank candidates by path length before selecting."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5(d) \u00e2\u20ac\u201d \"if an outbound order is waiting -> drops it in the OUTBOUND STAGING AREA (cross-dock)\"",
+   "severity": "blocker",
+   "missing": "There is NO cross-dock path in the autonomous brain. `_decideDestination` (putaway_robot_brain.dart:226-242) contains exactly three rules \u00e2\u20ac\u201d 5.2 loose (229), 5.3 case (234), 5.4 pallet (238) \u00e2\u20ac\u201d and returns null (241) when none match. It never consults an outbound order: its signature is `_decideDestination(WarehouseConfig cfg, String sku)` (226-227), taking only the static grid config and a SKU \u00e2\u20ac\u201d no `BrainContext`, no `ctx.board`, no Order read. There is no equivalent of the legacy `_hasOrderPending`/`_hasPalletInInventory`, no `packStation` branch, and `applier.stageOutbound` is never called. An inbound pallet for a SKU with an open outbound order is unconditionally put away into a rack, to be picked out again later. The doc comments at putaway_robot_brain.dart:4 (\"runs the 5.1\u00e2\u20ac\u201c5.4 rule\"), :53 (\"a capacity-aware 5.1\u00e2\u20ac\u201c5.4\") and :224 (\"5.1\u00e2\u20ac\u201c5.4 destination rule (ported from PalletPutawayController)\") are inaccurate \u00e2\u20ac\u201d 5.1 was NOT ported.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/putaway_robot_brain.dart \u00e2\u20ac\u201d `_decideDestination` must take `BrainContext` (not bare `WarehouseConfig`), query open outbound Orders for the SKU on `ctx.board`, select a free `CellType.packStation` stage cell (mirror `pick_robot_brain.dart:290-294 _findStage`), and the `_PR.dropping` case (134-148) must branch to `applier.stageOutbound(...)` instead of `applier.dropToRack(...)`."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5(b)/5(c) \u00e2\u20ac\u201d BREAKS pallet into cases -> CASE PICK AREA / into loose -> LOOSE PICK AREA",
+   "severity": "major",
+   "missing": "The break-to-case and break-to-loose branches are written but UNREACHABLE in any generated warehouse. `_belowThreshold` demands `room >= need` (putaway_robot_brain.dart:252-253, 256-258) with need = kLoosePerPallet (48) or kCasesPerPallet (12), but the default face capacities are rackLoose = 2 and rackCase = 2 (warehouse_config.dart:311-314 `_defaultMaxQty`: `if (t == CellType.rackCase) return 2; if (t == CellType.rackLoose) return 2;`), and `assignTemplateInventory` (warehouse_template_factory.dart:71-104) never overrides maxQuantity \u00e2\u20ac\u201d it only sets skuId/quantity via `cell.copyWith(skuId: sku, quantity: qty)` (94-95). 2 < 12 and 2 < 48, so 5.2 and 5.3 can never fire and 100% of pallets fall through to 5.4. The pick faces are therefore never replenished by the pallet robot \u00e2\u20ac\u201d case/loose stock only ever drains. The file's own comment at putaway_robot_brain.dart:246-247 admits this fall-through but treats it as acceptable.",
+   "where": "Capacity units must be reconciled in c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart (`_defaultMaxQty`, 311-314 \u00e2\u20ac\u201d rackCase/rackLoose capacities must be expressed in the same native units as the drop, i.e. >=12 cases / >=48 loose) and/or c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/warehouse_template_factory.dart (`assignTemplateInventory`, 71-104, to seed realistic maxQuantity). Alternatively putaway_robot_brain.dart:248-263 must support a partial drop (fill the face, return the remainder) rather than an all-or-nothing `room >= need`."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5(d) accounting \u00e2\u20ac\u201d a cross-docked pallet must satisfy the outbound order and not be double-served",
+   "severity": "major",
+   "missing": "`Order.divert(int looseUnits)` (job_board.dart:128-131) and the `divertedUnits` field (job_board.dart:110-112) are defined and feed `remainingUnits` (117-118), but `divert()` is NEVER called anywhere in lib/ (grep confirms only the definition and the `remainingUnits` read). The cross-dock accounting bucket is dead plumbing with no producer. `outboundDemandReservationProvider` \u00e2\u20ac\u201d required by the design at AUTONOMOUS_UNITS_DESIGN.md:185 and DESIGN_AMENDMENTS_v2.md:25 to stop putaway-5.1 and PickRobot both serving the same outbound line (issue SC-5) \u00e2\u20ac\u201d does not exist in lib/ at all.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart (add a `completeCrossDock`-style terminal that calls `divert()`), and a new `outboundDemandReservationProvider` alongside `rackReservationProvider` in c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/bay_resource.dart, read from putaway_robot_brain.dart's claim block (49-88)."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5(d) \u00e2\u20ac\u201d job model for a diverted pallet",
+   "severity": "minor",
+   "missing": "`JobKind` (job_board.dart:136-145) has driveTruckToBay, unloadTruck, putaway, rebalance, pickToStage, packAndLoad, departTruck, recovery \u00e2\u20ac\u201d there is no `crossDock` kind, and `Job` carries no `divertedFromInboundLineId` field (the design requires one at DESIGN_AMENDMENTS_v2.md:201 so the inbound line can be credited). A cross-docked pallet consequently has no way to close out the inbound order it was diverted from (design issue LCC-3, ADVERSARIAL_REVIEW.md:47).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart (JobKind enum 136-145; Job fields 152-176), and the staging slot metadata producer in c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/inbound_robot_brain.dart:116 which mints the putaway Job."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5 \u00e2\u20ac\u201d replenishment priority correctness",
+   "severity": "minor",
+   "missing": "The empty-face branch at putaway_robot_brain.dart:256-259 ignores `kReplenishThreshold` entirely and does not check SKU, so the FIRST empty loose face found in `cfg.cells` iteration order wins 5.2 outright \u00e2\u20ac\u201d pre-empting 5.3/5.4 even when the loose pick area for that SKU is full and the case area is starving. Selection is also first-match on unordered `cfg.cells` (249-261), not neediest-face-first, so replenishment is arbitrary rather than demand-driven.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/putaway_robot_brain.dart, `_belowThreshold` (248-263) \u00e2\u20ac\u201d rank candidate faces by fillFraction instead of returning the first hit."
+  },
+  {
+   "area": "pallet-pick-replenish",
+   "specPoint": "5 \u00e2\u20ac\u201d verification",
+   "severity": "minor",
+   "missing": "No test exercises 5.2 (break to loose), 5.3 (break to case), or 5.1 (cross-dock). p1_putaway_test.dart:30-34 builds a grid with only a palletStaging and a rackPallet cell; regression_putaway_capacity_test.dart:29-35 includes a rackLoose face but deliberately sizes it maxQuantity: 2 to assert the fall-through to rackPallet (72-76). Both green tests confirm only 5.4, which is why the unreachable 5.2/5.3 has gone unnoticed.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/test/ \u00e2\u20ac\u201d new cases with rackLoose maxQuantity >= 48 / rackCase maxQuantity >= 12 to prove the break paths, plus an open-outbound-order case to prove cross-dock once implemented."
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (GROUP TOGETHER per order)",
+   "severity": "blocker",
+   "missing": "There is NO per-order consolidation, and the data model cannot express it. `OutboundStageNotifier` state is `Map<String, String>` keyed cell -> SKU only (outbound_stage.dart:14, 17, 21-32) \u00e2\u20ac\u201d no orderId is ever recorded against a staged item. Nothing in the codebase can answer 'what is staged for order X'. Correspondingly the pick robot's `_findStage` (pick_robot_brain.dart:290-301) returns the FIRST free packStation cell anywhere in the warehouse, with no affinity to the order's other lines or to the order's shipBay \u00e2\u20ac\u201d two items of the same order would land on arbitrary, possibly distant, cells. The OR then hauls each staged item individually (one packAndLoad Job per staged pallet, minted at pick_robot_brain.dart:167-176) straight to the truck. Stock is shipped ONE UNIT AT A TIME; it is never grouped.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/outbound_stage.dart (state must become cell -> {skuId, orderId, units}); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart:290-301 (_findStage must pick an order-affiliated consolidation slot); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_robot_brain.dart:41-69 (claim gate must wait for the order's group to be complete)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (GROUP TOGETHER per order)",
+   "severity": "blocker",
+   "missing": "Grouping is structurally impossible today because an outbound Order is sized to exactly ONE UOM-unit: `final units = stocked.uom.looseUnits;` (outbound_order_generator_brain.dart:53) and exactly one pickToStage Job is minted for it (outbound_order_generator_brain.dart:61-69). The code comments admit this outright: 'One UOM-unit per order for now: the pipeline mints exactly one pick Job and ships one unit... Larger multi-unit orders would wedge the WIP slot until multi-unit explosion is wired (AC-6)' (outbound_order_generator_brain.dart:48-52). One order = one pick = one stage cell = one packAndLoad = one load. There is never more than one item in an order to group.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:48-69 (order must be sized > 1 unit and explode into N pick Jobs)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (truck DEPARTS WHEN FULL)",
+   "severity": "blocker",
+   "missing": "The outbound truck has NO capacity concept whatsoever. `OutboundTruckBrain` declares only orderId, _exit, _state, _bay, _seekTicks, _path, _pathIdx (outbound_truck_brain.dart:19-37) \u00e2\u20ac\u201d no capacity field, no loaded-units counter, no isFull check. The departure gate is `order.isSatisfied` (outbound_truck_brain.dart:88-89), which given a one-UOM-unit order means the truck DEPARTS AFTER EXACTLY ONE LOAD. A `TruckCapacity` model with real maxWeightKg/maxVolumeM3 tiers exists at warehouse_engine/constants/packaging_constants.dart:36-81 (kTruckCapacity S/M/L/XL) but is entirely unused by the application layer \u00e2\u20ac\u201d grep for kTruckCapacity|TruckCapacity|maxVolumeM3|maxWeightKg across lib/application returns no matches. 'Depart when full' is not implemented; it is 'depart when the single ordered unit is loaded'.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_truck_brain.dart:19-37 (add capacity + loaded counter) and :84-102 (gate departure on isFull || no-more-work, not order.isSatisfied); wire c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/constants/packaging_constants.dart:36-81"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (truck DEPARTS WHEN FULL)",
+   "severity": "blocker",
+   "missing": "One truck is spawned PER ORDER \u00e2\u20ac\u201d `unitRegistryProvider.notifier.register(OutboundTruckBrain(id: 'OTRUCK-$id-${_seq++}', ..., orderId: order.id))` inside the generator's per-order block (outbound_order_generator_brain.dart:70-76), and the truck is hard-bound to a single `final String orderId` (outbound_truck_brain.dart:28). A truck can therefore never carry more than one order, so it can never fill up from multiple orders. Combined with wipCap=1 (outbound_order_generator_brain.dart:19), the steady state is: one truck, one order, one unit, depart. Making trucks fill requires a truck that accepts multiple orders (or a much larger order), which the current 1:1 truck<->order binding forbids.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_truck_brain.dart:28 (orderId -> a manifest/list of orders); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:70-76 (assign orders to an existing docked truck with room, rather than spawning one each time)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (what closes the order, and when)",
+   "severity": "major",
+   "missing": "The Order closes at the LOAD, not at the ship. `completeJob(_jobId!, progressUnits: _units)` (outbound_robot_brain.dart:124) reaches job_board.dart:392-395 which sets `OrderStatus.closed` the instant progress hits orderedUnits \u00e2\u20ac\u201d while the truck is still sitting in the bay. The truck's departure is a consequence, not the cause: it polls and sees `order == null || order.isSatisfied` (outbound_truck_brain.dart:87-90) and only then drives off. The file's own header concedes this: 'Departure closing the order = shipped == loaded' (outbound_truck_brain.dart:7). So departure is cosmetic \u00e2\u20ac\u201d nothing observes it, and an order is reported shipped before the truck has moved a cell. `sweepTerminal` (job_board.dart:426-458) can even delete the closed Order out from under the still-docked truck, which is why the `order == null` branch exists.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_robot_brain.dart:124 (load should advance a truck-loaded counter, not close the order) and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_truck_brain.dart:104-107 (closeOrder on actual departure)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 / 5(d) (SHIPPING area, outbound staging)",
+   "severity": "major",
+   "missing": "There is no distinct shipping/outbound-staging cell type \u00e2\u20ac\u201d the stage reuses `CellType.packStation` (pick_robot_brain.dart:294 `c.type == CellType.packStation`). outbound_stage.dart:7-9 states this plainly as known debt: 'the design pins a distinct CellType.outboundStage separate from packStation. This increment reuses packStation cells to avoid the enum/exhaustive-switch churn; the distinct cell type lands with pack/load.' It never landed. Consequently the 'shipping area' is wherever packStation cells happen to be painted, with no guarantee of adjacency to the outbound bays \u00e2\u20ac\u201d so the OR's 'near the truck' property (spec 4) is a layout accident, not an enforced invariant, and the cross-dock outbound staging area of spec 5(d) has nowhere to exist.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/models/warehouse_config.dart (add CellType.outboundStage); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/pick_robot_brain.dart:290-301 (_findStage target); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/outbound_stage.dart:7-9 (remove the reuse note)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (ROUTES BY UOM, per-order lines)",
+   "severity": "major",
+   "missing": "`Order.lines` / `OrderLine` (job_board.dart:68-75, 87-88, 95) is dead scaffolding on the outbound path: the generator calls `mintOrder(kind:..., skuId:..., orderedUnits:..., nowTick:...)` and never passes `lines` (outbound_order_generator_brain.dart:55-60), so `lines` defaults to `const []` (job_board.dart:88). A multi-line order routed by UOM \u00e2\u20ac\u201d the precondition for grouping several differently-UOM'd items per order at a shipping area \u00e2\u20ac\u201d is not constructed anywhere. `OrderLine.id` is also what the idemKey scheme anticipates ('${order.id}:L0:0' is hardcoded to line 0, outbound_order_generator_brain.dart:67).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/outbound_order_generator_brain.dart:55-69 (populate lines and mint one pick Job per line with a per-line idemKey)"
+  },
+  {
+   "area": "shipping-consolidation",
+   "specPoint": "2 (order lifecycle observability)",
+   "severity": "minor",
+   "missing": "`OrderStatus.fulfilling` is declared (job_board.dart:65) and READ as a WIP-counting condition in two places (outbound_order_generator_brain.dart:40, stock_monitor_brain.dart:43) but is NEVER ASSIGNED anywhere in lib/ \u00e2\u20ac\u201d the only writes are `closed`/`aborted` (job_board.dart:394, 412, 362). An Order therefore jumps open -> closed with no in-progress state. Harmless for the WIP cap today (open still counts), but it means 'order is being consolidated / partially loaded' is unrepresentable, which a real depart-when-full flow needs.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart:386-397 (set fulfilling on first progress) or at claim time"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "9 (low battery -> robot drives to a charging area and charges itself)",
+   "severity": "major",
+   "missing": "Charging only ever triggers for an IDLE robot: startChargeIfNeeded bails on `!isChargeable || !_batteryLow || !isIdle` (unit_brain.dart:137). A robot that goes low WHILE running a Job never diverts \u00e2\u20ac\u201d it keeps working until battery hits 0 and is then force-dropped offline by the scheduler (unit_scheduler.dart:40-42, unit_brain.dart:212-219), which aborts its Job and sheds its cargo. The file's own comment concedes this: 'Mid-job (carrier-critical) preemption + die-en-route bounds are refinements' (unit_brain.dart:107). Spec 9 requires low battery -> go charge, unconditionally; today low battery mid-job means an abandoned order line, not a charge trip.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_brain.dart:135-155 (drop the isIdle gate / add a mid-job suspend+resume), and c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_scheduler.dart:39-45 (the gate ordering)"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "9 (low battery -> charge)",
+   "severity": "major",
+   "missing": "Two unhandled starvation cases leave a low robot permanently uncharged. (a) If the warehouse has no charger cells, startChargeIfNeeded returns false (unit_brain.dart:139, comment 'no chargers -> rules-only (EC-3 note)') and the robot keeps claiming work at any battery level until it dies at 0. (b) If all chargers are occupied, claimFirstFree returns null and it just 'retries next tick' (unit_brain.dart:142-143) with no queueing/nearest-charger choice \u00e2\u20ac\u201d and because idleStep hard-refuses to move when `_batteryLow` (unit_brain.dart:251), that robot now neither charges nor patrols: it is frozen on the floor until a charger frees up. Note also that the charger chosen is simply the FIRST free one in cell order (unit_brain.dart:183-186 + claimFirstFree), not the nearest \u00e2\u20ac\u201d so 'drives to a charging area' can mean a needlessly long trip a low robot may not survive.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_brain.dart:135-155 (charger selection: score candidates by A* distance instead of first-free) and :250-251 (the patrol battery gate)"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "8 (robots always take the shortest path) + collision wiring",
+   "severity": "major",
+   "missing": "The charge route bypasses the P6 hard collision arbiter. chargeStep advances with `ActionApplier(...).moveTo(this, _chargePath[_chargeIdx])` (unit_brain.dart:162) \u00e2\u20ac\u201d the unchecked mover \u00e2\u20ac\u201d whereas every other movement goes through tryStep, which honours the per-tick cellReservationProvider and holds when the target cell is taken (action_applier.dart:47-55, used at unit_brain.dart:287). A charge-seeking robot therefore walks onto/through cells reserved by other units, defeating the arbiter the scheduler seeds each tick (unit_scheduler.dart:49-53).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/unit_brain.dart:160-166 (use ActionApplier.tryStep and hold on refusal)"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "8 (shortest path)",
+   "severity": "minor",
+   "missing": "findPath's walkability default is `walkable ?? (_) => true` (pathfinding.dart:107), i.e. when a caller omits the predicate EVERY cell \u00e2\u20ac\u201d racks, obstacles, trees \u00e2\u20ac\u201d is treated as walkable and the 'shortest path' returned is a straight-line Manhattan route through solid inventory. estimateTicks() is exactly such a caller: it forwards only `occupied` and never a walkable predicate (pathfinding.dart:178-182), so any ETA/travel-cost decision built on it is computed against a phantom empty warehouse. The class doc contradicts the code, claiming the default is `isCellWalkable` (pathfinding.dart:99). (Operational brains all pass a predicate, so live movement is unaffected today \u00e2\u20ac\u201d this is a latent trap plus a broken estimator.)",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/warehouse_engine/services/pathfinding.dart:100-107 (make `walkable` required or default to a real grid check) and :178-182 (estimateTicks must accept/forward it)"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "wiring (spec 4-7: the full robot cast must exist)",
+   "severity": "major",
+   "missing": "Role coverage depends entirely on the spawn COUNT, silently. `roles[i % roles.length]` (sim_bootstrap.dart:62) means fewer than 4 spawned robots yields a warehouse missing whole functions \u00e2\u20ac\u201d 3 robots => no OutboundRobot at all (nothing ever loads the outbound truck); 2 => no picker and no OR. There is no assertion or minimum. Compounding this, the switch's catch-all `_ => OutboundRobotBrain(...)` (sim_bootstrap.dart:67) means any future role added to the `roles` list without a matching case silently becomes an outbound robot instead of failing loudly.",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart:59-71 (guarantee >= one of each role before round-robining the remainder; make the switch exhaustive over UnitRole rather than defaulting)"
+  },
+  {
+   "area": "crosscutting",
+   "specPoint": "wiring / role set integrity",
+   "severity": "minor",
+   "missing": "Three UnitRole values are dead. UnitRole.bayAllocator and UnitRole.recovery (job_board.dart:55-56) have NO brain class anywhere in lib/application/brains/ and are never registered \u00e2\u20ac\u201d despite goOffline() (unit_brain.dart:212-219) explicitly relying on 'a recovery tow' in its doc comment (unit_brain.dart:43-44, :210-211); recovery is in fact done in-place by offlineRecoverStep (unit_brain.dart:222-225), so no recovery unit is ever dispatched. UnitRole.scout (job_board.dart:48) has a brain (scout_brain.dart:17) that bootstrapSimUnits never registers \u00e2\u20ac\u201d exploration now rides on ActionApplier.moveTo's fog reveal from working robots (sim_bootstrap.dart:45-47).",
+   "where": "c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/job_board.dart:47-59 (remove the dead values) or c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/sim_bootstrap.dart (register real bayAllocator/recovery brains); c:/Users/krish/AndroidStudioProjects/Warehouse/WarehouseSimulator/lib/application/brains/scout_brain.dart is currently unreferenced by the bootstrap"
+  }
+ ]
+}

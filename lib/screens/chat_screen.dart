@@ -161,11 +161,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             color: const Color(0xFF0F2010),
-            child: Row(
+            child: const Row(
               children: [
-                const Text('🚧', style: TextStyle(fontSize: 13)),
-                const SizedBox(width: 8),
-                const Text(
+                Text('🚧', style: TextStyle(fontSize: 13)),
+                SizedBox(width: 8),
+                Text(
                   'Work in Progress — AI responses may be incomplete.',
                   style: TextStyle(
                     fontSize: 11,

@@ -87,7 +87,7 @@ class RobotCard extends StatelessWidget {
                     const Icon(Icons.inventory_2, size: 10, color: Color(0xFFFF8800)),
                     const SizedBox(width: 4),
                     Text(
-                      '${cargo!.skuId}',
+                      cargo!.skuId,
                       style: const TextStyle(
                           fontSize: 9,
                           color: Color(0xFFFF8800),

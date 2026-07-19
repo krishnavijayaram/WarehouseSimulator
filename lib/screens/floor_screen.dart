@@ -14,12 +14,16 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../core/api_client.dart';
 import '../core/auth/auth_provider.dart';
 import '../application/event_bus.dart';
 import '../application/manual_robot_controller.dart';
+import '../application/inbound_ops_controller.dart';
+import '../application/pallet_putaway_controller.dart';
 import '../application/providers.dart';
 import '../application/robot_scout_simulation.dart';
+import '../application/warehouse_readiness.dart';
 import '../core/sim_ws.dart';
 import '../models/sim_frame.dart';
 import '../models/warehouse_config.dart';
@@ -69,6 +73,16 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   String? _selectedTruckId;
   String? _lastPolledWarehouseId;
 
+  // ── Reality / WMS schema toggle ─────────────────────────────────────────
+  String _schemaView = 'REALITY'; // 'REALITY' | 'WMS'
+  Set<String> _divergentCells = {};
+  Timer? _divergenceTimer;
+
+  // ── Session time limit ───────────────────────────────────────────────────
+  Timer? _sessionCountdownTimer;
+  int?  _remainingSecs;      // null = unlimited (privileged user)
+  bool  _sessionPrivileged = false;
+
   @override
   void initState() {
     super.initState();
@@ -78,21 +92,89 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     )..repeat(reverse: true);
     _blinkAnim = CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut);
     _truckPollTimer =
-        Timer.periodic(const Duration(seconds: 5), (_) => _pollInboundTrucks());
+        // 5min, not 5s: this poll was ~80% of all DB traffic (12 hits/min/user) on
+        // the Postgres instance shared with EventXplore. This is an academic sim —
+        // backend truck data being a few minutes stale is fine, and it cuts this
+        // poll's load by 60x. (Sim-spawned trucks are local and unaffected.)
+        Timer.periodic(
+            const Duration(minutes: 5), (_) => _pollInboundTrucks());
   }
 
   @override
   void dispose() {
     _stopHeartbeat();
     _truckPollTimer?.cancel();
+    _divergenceTimer?.cancel();
+    _sessionCountdownTimer?.cancel();
     _blinkCtrl.dispose();
     _focusNode.dispose();
     super.dispose();
   }
 
+  // ── Session timer ─────────────────────────────────────────────────────────
+
+  Future<void> _startSessionTimer(String sessionId, String email) async {
+    try {
+      final data = await ApiClient.instance.registerSimSession(
+        sessionId: sessionId,
+        email: email,
+      );
+      final maxSecs = data['max_secs'] as int?;
+      final privileged = data['is_privileged'] as bool? ?? false;
+      if (!mounted) return;
+      setState(() {
+        _sessionPrivileged = privileged;
+        _remainingSecs = maxSecs;
+      });
+      if (maxSecs == null) return; // privileged — no countdown needed
+      _sessionCountdownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+        if (!mounted) { t.cancel(); return; }
+        setState(() {
+          _remainingSecs = (_remainingSecs ?? 0) - 1;
+        });
+        if ((_remainingSecs ?? 0) <= 0) {
+          t.cancel();
+          _onSessionExpired();
+        }
+      });
+    } catch (_) {
+      // If registration fails, do not block operations — just no timer shown.
+    }
+  }
+
+  void _onSessionExpired() {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF161B22),
+        title: const Text('Session Ended',
+            style: TextStyle(color: Color(0xFFFF4444), fontFamily: 'ShareTechMono')),
+        content: const Text(
+          'Your 30-minute session has ended.\nPlease contact the administrator for extended access.',
+          style: TextStyle(color: Color(0xFF8B949E), fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK', style: TextStyle(color: Color(0xFF00D4FF))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatCountdown(int secs) {
+    final m = (secs ~/ 60).toString().padLeft(2, '0');
+    final s = (secs % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
   // ── Inbound truck polling ────────────────────────────────────────────────
 
   Future<void> _pollInboundTrucks() async {
+    if (!_isSimOwner) return; // static view for everyone else — no backend polling
     final cfg = ref.read(warehouseConfigProvider);
     if (cfg == null) {
       // Retry once more in case the config just loaded
@@ -143,6 +225,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   /// claim (or be denied) the edit lock, then repeats every 45 s.
   /// The backend LOCK_TTL_SECS = 60 s — 45 s keeps us comfortably inside it.
   Future<void> _startHeartbeat(WarehouseConfig config) async {
+    if (!_isSimOwner) return; // non-owners hold no edit lock and do no polling
     _stopHeartbeat(); // cancel any previous timer (e.g. after re-publish)
     _heartbeatWarehouseId = config.id;
     await _sendHeartbeat(config.id);
@@ -150,6 +233,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
       const Duration(seconds: 45),
       (_) => _sendHeartbeat(config.id),
     );
+    _startDivergencePolling(config.id);
   }
 
   Future<void> _sendHeartbeat(String warehouseId) async {
@@ -201,16 +285,82 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     }
   }
 
+  // ── Reality/WMS divergence polling ──────────────────────────────────────
+
+  void _startDivergencePolling(String warehouseId) {
+    _divergenceTimer?.cancel();
+    _pollDivergences();
+    _divergenceTimer = Timer.periodic(
+        // 10min, not 30s: background Reality↔WMS reconciliation is never urgent,
+        // and this shares a DB instance with EventXplore.
+        const Duration(minutes: 10), (_) => _pollDivergences());
+  }
+
+  Future<void> _pollDivergences() async {
+    if (!_isSimOwner) return; // static view for everyone else — no backend polling
+    final cfg = ref.read(warehouseConfigProvider);
+    if (cfg == null) return;
+    try {
+      final divs = await ApiClient.instance.getRackDivergences(cfg.id);
+      if (!mounted) return;
+      setState(() {
+        _divergentCells = {
+          for (final d in divs) '${d['row']},${d['col']}'
+        };
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _handleCellExplore(
+      String warehouseId, int row, int col) async {
+    // EX-safety: exploreCell is a Reality->WMS read+write transaction — owner
+    // session only, so rapid tapping by any visitor can't burst writes.
+    if (!_isSimOwner) return;
+    try {
+      await ApiClient.instance.exploreCell(
+        warehouseId: warehouseId,
+        row: row,
+        col: col,
+      );
+      await _pollDivergences();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Cell ($row,$col) synced — Reality → WMS'),
+          duration: const Duration(seconds: 2),
+          backgroundColor: const Color(0xFF1E3A5F),
+        ));
+      }
+    } catch (_) {}
+  }
+
+  /// The LIVE simulator + all its backend polling run for the single owner
+  /// account only; every other visitor sees a frozen static view. This bounds all
+  /// dynamic DB traffic to one session — the deliberate EX-safety cap ("one
+  /// connection is enough"): one active user cannot exhaust the shared pool.
+  /// NOTE: a client-side gate is not a security boundary (the enforced guarantee
+  /// is still the Postgres role CONNECTION LIMIT); it is what makes the app quiet
+  /// for everyone else.
+  bool get _isSimOwner {
+    final auth = ref.read(authProvider);
+    return auth is AuthLoggedIn && auth.user.isPrivileged;
+  }
+
   /// Actually starts bots and the scout simulation. Separated so it can be
   /// called both from Start Operations (EDITOR path) and from a heartbeat
   /// that discovers the previous editor left.
   void _launchSimulation(WarehouseConfig config) {
+    // Only the owner runs the live sim; everyone else gets the static warehouse
+    // (no sim → robots render at their static spawns, nothing moves).
+    if (!_isSimOwner) return;
     final prevSim = ref.read(scoutSimulationProvider);
     prevSim?.dispose();
     final scout = RobotScoutSimulation(
       config: config,
       ref: ref,
       isSaboteur: false,
+      // EX-SAFETY: the deployed sim is client-only — it must never write to the
+      // backend shared with EventXplore. Explicit, not just relying on default.
+      backendSync: false,
     );
     ref.read(scoutSimulationProvider.notifier).state = scout;
     // Manual mode: never create the step timer — robots only move via STEP.
@@ -219,6 +369,27 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     } else {
       scout.start();
     }
+  }
+
+  /// Explain up-front why the autonomous run might idle on this warehouse (no
+  /// pack station, no stock, too few robots, …) instead of leaving the user
+  /// staring at motionless robots. No issues ⇒ stays quiet.
+  void _warnIfNotReady(WarehouseConfig config) {
+    final issues = checkWarehouseReadiness(config);
+    if (issues.isEmpty || !mounted) return;
+    final hasBlocker = issues.any((i) => i.isBlocker);
+    final lines = issues.map((i) => '• ${i.message}').join('\n');
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      duration: const Duration(seconds: 12),
+      backgroundColor:
+          hasBlocker ? const Color(0xFF7F1D1D) : const Color(0xFF78350F),
+      content: Text(
+        hasBlocker
+            ? 'This warehouse can\'t run the full loop yet — robots may idle:\n$lines'
+            : 'Operations started. Heads up:\n$lines',
+        style: const TextStyle(height: 1.4),
+      ),
+    ));
   }
 
   KeyEventResult _handleKeyEvent(FocusNode _, KeyEvent event) {
@@ -250,7 +421,15 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
 
     // Poll trucks immediately whenever the active warehouse changes.
     ref.listen<WarehouseConfig?>(warehouseConfigProvider, (prev, next) {
-      if (next != null && next.id != _lastPolledWarehouseId) {
+      if (next != null) {
+        // Always clear stale truck state and re-poll whenever the warehouse
+        // config changes (covers both new-ID publish and same-ID re-publish).
+        setState(() {
+          _inboundTrucks = [];
+          _shipmentsByTruck = {};
+          _truckApproach = {};
+          _selectedTruckId = null;
+        });
         _lastPolledWarehouseId = next.id;
         _pollInboundTrucks();
       }
@@ -278,6 +457,23 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     final simMode = ref.watch(simulationModeProvider);
     final sim = ref.watch(scoutSimulationProvider);
     final manualPositions = ref.watch(manualRobotPositionsProvider);
+    // Live sim-pipeline diagnostic (shown in the ops badge) so "no robot moved"
+    // can be localised at a glance: tracked 0 ⇒ the sim never started (heartbeat/
+    // access gate or the tick loop) — nothing was even seeded; tracked N but
+    // moving 0 ⇒ robots exist but aren't moving (no work + patrol); moving > 0 but
+    // the floor looks static ⇒ a render bug, not a sim bug.
+    var movedRobots = 0;
+    {
+      final spawnCell = <String, String>{};
+      for (final s in (config?.robotSpawns ?? const <RobotSpawn>[])) {
+        spawnCell[s.name ?? '${s.robotType}-${s.row}-${s.col}'] =
+            '${s.row}_${s.col}';
+      }
+      manualPositions.forEach((id, p) {
+        final sc = spawnCell[id];
+        if (sc != null && '${p.row}_${p.col}' != sc) movedRobots++;
+      });
+    }
     final selectedRobotId = ref.watch(selectedRobotIdProvider);
     final manualCtrl = ref.watch(manualRobotControllerProvider);
     final editAccess = ref.watch(editAccessProvider);
@@ -308,8 +504,11 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
           ? frame.robots
           : (config?.robotSpawns
                   .map((s) => Robot(
-                        id: s.name ?? s.robotType,
-                        name: s.name ?? s.robotType,
+                        // MUST match the brain/bot id (_buildBots uses this exact
+                        // format) so a moved robot's override replaces its static
+                        // spawn instead of rendering as a second ghost robot.
+                        id: s.name ?? '${s.robotType}-${s.row}-${s.col}',
+                        name: s.name ?? '${s.robotType}-${s.row}-${s.col}',
                         type: s.robotType,
                         x: s.col.toDouble(),
                         y: s.row.toDouble(),
@@ -365,6 +564,50 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
         appBar: AppBar(
           title: const Text('FLOOR VIEW'),
           actions: [
+            // ── Session countdown chip ────────────────────────────────────
+            if (opsStarted && _remainingSecs != null) ...[
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: (_remainingSecs! <= 300)
+                        ? const Color(0xFF4A1515)
+                        : const Color(0xFF1A2A1A),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: (_remainingSecs! <= 300)
+                          ? const Color(0xFFFF4444)
+                          : const Color(0xFF00FF88),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.timer_outlined,
+                        size: 12,
+                        color: (_remainingSecs! <= 300)
+                            ? const Color(0xFFFF4444)
+                            : const Color(0xFF00FF88),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _formatCountdown(_remainingSecs!),
+                        style: TextStyle(
+                          fontFamily: 'ShareTechMono',
+                          fontSize: 11,
+                          color: (_remainingSecs! <= 300)
+                              ? const Color(0xFFFF4444)
+                              : const Color(0xFF00FF88),
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
             // ── Manual step controls in AppBar (don't overlay the canvas) ──
             if (opsStarted && simMode == 'manual' && sim != null) ...[
               Tooltip(
@@ -393,6 +636,43 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
               ),
               const VerticalDivider(width: 1),
             ],
+            // ── Reality / WMS schema toggle ─────────────────────────────
+            if (opsStarted)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                child: SegmentedButton<String>(
+                  segments: [
+                    ButtonSegment(
+                      value: 'REALITY',
+                      label: Text('REALITY',
+                          style: TextStyle(
+                              fontSize: 10,
+                              color: _schemaView == 'REALITY'
+                                  ? const Color(0xFF0D1117)
+                                  : const Color(0xFF8B949E))),
+                    ),
+                    ButtonSegment(
+                      value: 'WMS',
+                      label: Text('WMS',
+                          style: TextStyle(
+                              fontSize: 10,
+                              color: _schemaView == 'WMS'
+                                  ? const Color(0xFF0D1117)
+                                  : const Color(0xFF8B949E))),
+                    ),
+                  ],
+                  selected: {_schemaView},
+                  onSelectionChanged: (v) =>
+                      setState(() => _schemaView = v.first),
+                  style: SegmentedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0D1117),
+                    selectedBackgroundColor: const Color(0xFF00D4FF),
+                    side: const BorderSide(color: Color(0xFF30363D)),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                ),
+              ),
             IconButton(
               icon: const Icon(Icons.fit_screen),
               tooltip: 'Reset zoom',
@@ -465,6 +745,27 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                         });
                         ref.read(selectedRobotIdProvider.notifier).state = null;
                       }
+                      // Reality mode: tap any cell to sync it to WMS
+                      if (opsStarted &&
+                          _schemaView == 'REALITY' &&
+                          config != null &&
+                          hit == null &&
+                          truckHit == null) {
+                        final cw =
+                            (_canvasSize.width / floorCols) * _scale;
+                        final ch =
+                            (_canvasSize.height / floorRows) * _scale;
+                        final col = ((d.localPosition.dx - _offset.dx) / cw)
+                            .floor();
+                        final row = ((d.localPosition.dy - _offset.dy) / ch)
+                            .floor();
+                        if (row >= 0 &&
+                            row < floorRows &&
+                            col >= 0 &&
+                            col < floorCols) {
+                          _handleCellExplore(config.id, row, col);
+                        }
+                      }
                     },
                     onSecondaryTapUp: (d) =>
                         _showFloorCellContextMenu(d.localPosition, context),
@@ -480,8 +781,8 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                             scale: _scale,
                             offset: _offset,
                             warehouseConfig: config,
-                            exploredCells:
-                                opsStarted ? exploredCells : const {},
+                            exploredCells: exploredCells,
+                            fogEnabled: opsStarted,
                             activeEvents: activeEvents,
                             blinkPhase: _blinkAnim.value,
                             selectedRobotId: selectedRobotId,
@@ -490,6 +791,8 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                             shipmentsByTruck: _shipmentsByTruck,
                             truckApproach: _truckApproach,
                             selectedTruckId: _selectedTruckId,
+                            divergentCells: opsStarted ? _divergentCells : const {},
+                            showRealitySchema: opsStarted && _schemaView == 'REALITY',
                           ),
                           child: const SizedBox.expand(),
                         ),
@@ -548,9 +851,25 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                 left: 0,
                 right: 0,
                 child: Center(
-                  child: DPadControls(
-                    controller: manualCtrl,
-                    selectedRobotId: selectedRobotId,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      DPadControls(
+                        controller: manualCtrl,
+                        selectedRobotId: selectedRobotId,
+                      ),
+                      const SizedBox(width: 12),
+                      _PickDropButtons(
+                        selectedRobotId: selectedRobotId,
+                        onPick: selectedRobotId == null
+                            ? null
+                            : () => _handlePickAction(selectedRobotId),
+                        onDrop: selectedRobotId == null
+                            ? null
+                            : () => _handleDropAction(selectedRobotId),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -564,6 +883,31 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                   explored: exploredCells.length,
                   total: config.rows * config.cols,
                   simMode: simMode,
+                ),
+              ),
+
+            // ── Static-view banner ───────────────────────────────────────────
+            // Non-owners see a frozen warehouse (no live sim, no polling) so all
+            // dynamic DB traffic stays on the owner's single session.
+            if (!_isSimOwner)
+              Positioned(
+                top: 12,
+                left: 12,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B).withAlpha(230),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF334155)),
+                  ),
+                  child: const Text(
+                    'Static view — live simulation runs on the owner\'s session',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF94A3B8),
+                        fontWeight: FontWeight.w600),
+                  ),
                 ),
               ),
 
@@ -601,7 +945,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                 top: 12,
                 right: 12,
                 child: _InfoBadge(
-                  '${displayRobots.length} robots · wave ${frame.waveNumber}${frame.robots.isEmpty && displayRobots.isNotEmpty ? ' (parked)' : ''}',
+                  '${displayRobots.length} robots · tracked ${manualPositions.length} · moving $movedRobots · wave ${frame.waveNumber}${frame.robots.isEmpty && displayRobots.isNotEmpty ? ' (parked)' : ''}',
                 ),
               ),
           ],
@@ -675,13 +1019,30 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                 icon: const Icon(Icons.play_circle_outline, size: 22),
                 label: const Text('START OPERATIONS'),
                 onPressed: () async {
-                  ref.read(simulationModeProvider.notifier).state = 'manual';
+                  // Start the simulator SIMULATING: automated mode creates the
+                  // tick loop so the autonomous brains actually run. (Manual mode
+                  // never starts the timer, so robots would just sit idle — the
+                  // "robots don't move, I can't find the automation" bug.) The
+                  // user can still drop to manual/STEP from the toolbar.
+                  ref.read(simulationModeProvider.notifier).state = 'automated';
                   ref.read(exploredCellsProvider.notifier).reset();
                   ref.read(activeEventsProvider.notifier).resolveAll();
                   ref.read(operationsStartedProvider.notifier).state = true;
                   ref
                       .read(manualRobotControllerProvider.notifier)
                       .initialize(config);
+
+                  // Initialize inbound & putaway controllers
+                  ref.read(inboundOpsControllerProvider.notifier).state =
+                      InboundOpsController(config: config, ref: ref);
+                  ref.read(palletPutawayControllerProvider.notifier).state =
+                      PalletPutawayController(config: config, ref: ref);
+
+                  // Hydrate robot cargo from backend
+                  if (_isSimOwner) {
+                    ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+                  }
+
                   // Claim the edit lock via heartbeat first.
                   // EDITOR → launch bots immediately.
                   // VIEWER → show view-mode banner; bots start when the editor
@@ -690,6 +1051,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
                   final access = ref.read(editAccessProvider);
                   if (access != 'VIEWER') {
                     _launchSimulation(config);
+                    _warnIfNotReady(config);
                   }
                 },
               ),
@@ -698,6 +1060,187 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
         ),
       ),
     );
+  }
+
+  // ── Pick / Drop action handlers ──────────────────────────────────────────
+
+  Future<void> _handlePickAction(String robotId) async {
+    final positions = ref.read(manualRobotPositionsProvider);
+    final pos = positions[robotId];
+    if (pos == null) return;
+    final config = ref.read(warehouseConfigProvider);
+    if (config == null) return;
+
+    final row = pos.row;
+    final col = pos.col;
+
+    // Determine what we can pick from adjacent cells
+    // 1. Adjacent to dock → pick from truck (inbound pick)
+    // 2. Adjacent to staging → pick from staging (putaway pick)
+    String? error;
+
+    // Check for adjacent dock / inbound (truck pick)
+    final adjDock = _findAdjacentCellOfType(
+        config, row, col, {CellType.inbound, CellType.dock});
+    if (adjDock != null) {
+      // Find a docked truck at this dock
+      final truck = _findDockedTruckAtCell(adjDock.$1, adjDock.$2);
+      if (truck != null) {
+        final truckId = truck['truck_id'] as String? ?? '';
+        final cargo = truck['cargo'] as List<dynamic>? ?? [];
+        if (cargo.isNotEmpty) {
+          final firstCargo = cargo.first as Map<String, dynamic>;
+          final skuId = firstCargo['sku_id'] as String? ?? '';
+          if (skuId.isNotEmpty) {
+            final ctrl = ref.read(inboundOpsControllerProvider);
+            if (ctrl != null) {
+              error = await ctrl.manualPickFromTruck(
+                robotId: robotId,
+                robotRow: row,
+                robotCol: col,
+                truckId: truckId,
+                skuId: skuId,
+              );
+            } else {
+              error = 'Inbound controller not initialized';
+            }
+          } else {
+            error = 'No SKU in truck cargo';
+          }
+        } else {
+          error = 'Truck has no cargo to pick';
+        }
+      } else {
+        error = 'No docked truck at adjacent bay';
+      }
+      _showPickDropResult(error);
+      return;
+    }
+
+    // Check for adjacent staging (putaway pick)
+    final adjStaging =
+        _findAdjacentCellOfType(config, row, col, {CellType.palletStaging});
+    if (adjStaging != null) {
+      final ctrl = ref.read(palletPutawayControllerProvider);
+      if (ctrl != null) {
+        error = await ctrl.manualPickFromStaging(
+          robotId: robotId,
+          robotRow: row,
+          robotCol: col,
+        );
+      } else {
+        error = 'Putaway controller not initialized';
+      }
+      _showPickDropResult(error);
+      return;
+    }
+
+    _showPickDropResult('No pickable cell adjacent to robot. '
+        'Must be next to a dock (with truck) or pallet staging.');
+  }
+
+  Future<void> _handleDropAction(String robotId) async {
+    final positions = ref.read(manualRobotPositionsProvider);
+    final pos = positions[robotId];
+    if (pos == null) return;
+    final config = ref.read(warehouseConfigProvider);
+    if (config == null) return;
+
+    final row = pos.row;
+    final col = pos.col;
+    final cargo = ref.read(robotCargoProvider)[robotId];
+
+    if (cargo == null) {
+      _showPickDropResult('Robot is not carrying anything');
+      return;
+    }
+
+    String? error;
+
+    // Check for adjacent staging (inbound drop)
+    final adjStaging =
+        _findAdjacentCellOfType(config, row, col, {CellType.palletStaging});
+    if (adjStaging != null) {
+      final ctrl = ref.read(inboundOpsControllerProvider);
+      if (ctrl != null) {
+        error = await ctrl.manualDropAtStaging(
+          robotId: robotId,
+          robotRow: row,
+          robotCol: col,
+        );
+      } else {
+        error = 'Inbound controller not initialized';
+      }
+      _showPickDropResult(error);
+      return;
+    }
+
+    // Check for adjacent rack or pack station (putaway drop)
+    final adjRack = _findAdjacentCellOfType(config, row, col, {
+      CellType.rackPallet,
+      CellType.rackCase,
+      CellType.rackLoose,
+      CellType.packStation,
+    });
+    if (adjRack != null) {
+      final ctrl = ref.read(palletPutawayControllerProvider);
+      if (ctrl != null) {
+        error = await ctrl.manualDropAtDest(
+          robotId: robotId,
+          robotRow: row,
+          robotCol: col,
+        );
+      } else {
+        error = 'Putaway controller not initialized';
+      }
+      _showPickDropResult(error);
+      return;
+    }
+
+    _showPickDropResult('No valid drop target adjacent to robot. '
+        'Must be next to staging, a rack (same SKU or empty), or pack station.');
+  }
+
+  ({int $1, int $2})? _findAdjacentCellOfType(
+      WarehouseConfig config, int row, int col, Set<CellType> types) {
+    const dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+    for (final (dr, dc) in dirs) {
+      final nr = row + dr;
+      final nc = col + dc;
+      if (nr < 0 || nr >= config.rows || nc < 0 || nc >= config.cols) continue;
+      final t = config.typeAt(nr, nc);
+      if (types.contains(t)) return ($1: nr, $2: nc);
+    }
+    return null;
+  }
+
+  Map<String, dynamic>? _findDockedTruckAtCell(int row, int col) {
+    for (final truck in _inboundTrucks) {
+      final status = (truck['status'] as String? ?? '').toUpperCase();
+      if (status == 'DOCKED' || status == 'UNLOADING') {
+        final prog = _truckApproach[truck['truck_id']] ?? 0.0;
+        if (prog >= 1.0) return truck;
+      }
+    }
+    return null;
+  }
+
+  void _showPickDropResult(String? error) {
+    if (!mounted) return;
+    if (error == null) {
+      setState(() {}); // refresh UI
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        backgroundColor: Color(0xFF059669),
+        content: Text('✅ Success', style: TextStyle(color: Colors.white)),
+        duration: Duration(seconds: 2),
+      ));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: const Color(0xFFEF4444).withAlpha(220),
+        content: Text(error, style: const TextStyle(color: Colors.white)),
+        duration: const Duration(seconds: 3),
+      ));
+    }
   }
 
   /// Compact floating button shown before ops start so the floor/trucks remain
@@ -718,15 +1261,48 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
         icon: const Icon(Icons.play_circle_outline, size: 20),
         label: const Text('START OPERATIONS'),
         onPressed: () async {
-          ref.read(simulationModeProvider.notifier).state = 'manual';
+          // Automated mode so the sim actually runs the autonomous loop on start
+          // (manual mode never creates the tick timer → robots sit idle).
+          ref.read(simulationModeProvider.notifier).state = 'automated';
           ref.read(exploredCellsProvider.notifier).reset();
           ref.read(activeEventsProvider.notifier).resolveAll();
           ref.read(operationsStartedProvider.notifier).state = true;
-          ref.read(manualRobotControllerProvider.notifier).initialize(config);
+          // EX-safety: ManualRobotController seeds + posts 6-table observation
+          // WRITES per robot — owner session only.
+          if (_isSimOwner) {
+            manualControllerWritesEnabled = true; // owner session may write
+            ref.read(manualRobotControllerProvider.notifier).initialize(config);
+          }
+
+          // Persist ops-started so fog survives page refresh.
+          SharedPreferences.getInstance().then((prefs) {
+            prefs.setBool('ops_started', true);
+            prefs.setString('ops_warehouse_id', config.id);
+            prefs.remove('explored_cells_${config.id}');
+          });
+
+          // Initialize inbound & putaway controllers
+          ref.read(inboundOpsControllerProvider.notifier).state =
+              InboundOpsController(config: config, ref: ref);
+          ref.read(palletPutawayControllerProvider.notifier).state =
+              PalletPutawayController(config: config, ref: ref);
+
+          // Hydrate robot cargo from backend (transactional source of truth)
+          if (_isSimOwner) {
+            ref.read(robotCargoProvider.notifier).hydrateFromBackend();
+          }
+
           await _startHeartbeat(config);
           final access = ref.read(editAccessProvider);
           if (access != 'VIEWER') {
             _launchSimulation(config);
+            _warnIfNotReady(config);
+          }
+
+          // EX-safety: registerSimSession is a backend write — owner session only.
+          final auth = ref.read(authProvider);
+          if (auth is AuthLoggedIn && _isSimOwner) {
+            _startSessionTimer(auth.session.effectiveSessionId, auth.user.email);
           }
         },
       ),
@@ -1286,8 +1862,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
     List<Map<String, dynamic>> trucks,
     Map<String, double> approach,
   ) {
-    if (config == null || trucks.isEmpty || _canvasSize == Size.zero)
+    if (config == null || trucks.isEmpty || _canvasSize == Size.zero) {
       return null;
+    }
     final rows = config.rows;
     final cols = config.cols;
     final cw = (_canvasSize.width / cols) * _scale;
@@ -1684,6 +2261,7 @@ class FloorPainter extends CustomPainter {
     required this.offset,
     this.warehouseConfig,
     this.exploredCells = const {},
+    this.fogEnabled = false,
     this.activeEvents = const {},
     this.blinkPhase = 0.0,
     this.selectedRobotId,
@@ -1694,6 +2272,8 @@ class FloorPainter extends CustomPainter {
     this.selectedTruckId,
     this.robotCargo = const {},
     this.stagingPallets = const {},
+    this.divergentCells = const {},
+    this.showRealitySchema = false,
   });
 
   final List<Robot> robots;
@@ -1705,6 +2285,11 @@ class FloorPainter extends CustomPainter {
 
   /// Set of "row,col" keys for cells revealed by robot scouting.
   final Set<String> exploredCells;
+
+  /// When true, fog-of-war is active (ops started). Cells not in
+  /// [exploredCells] are drawn as black regardless of set size.
+  /// When false (pre-ops / design mode) the entire warehouse is visible.
+  final bool fogEnabled;
 
   /// Map from "row,col" → event descriptor for cells that should blink.
   final Map<String, String> activeEvents;
@@ -1733,8 +2318,17 @@ class FloorPainter extends CustomPainter {
   /// "row_col" → StagingSlot for pallet staging cells with pallets on them.
   final Map<String, StagingSlot> stagingPallets;
 
-  bool _isExplored(int row, int col) =>
-      exploredCells.isEmpty || exploredCells.contains('$row,$col');
+  /// Set of "row,col" strings where Reality qty ≠ WMS qty.
+  final Set<String> divergentCells;
+
+  /// When true, the floor is in Reality view — divergent cells are highlighted
+  /// and tapping a cell syncs it to WMS.
+  final bool showRealitySchema;
+
+  bool _isExplored(int row, int col) {
+    if (!fogEnabled) return true; // pre-ops: everything visible
+    return exploredCells.contains('$row,$col');
+  }
 
   Color? _eventColor(int row, int col) {
     final ev = activeEvents['$row,$col'];
@@ -1774,6 +2368,7 @@ class FloorPainter extends CustomPainter {
     _drawGrid(canvas, size);
     _drawAisleLabels(canvas, size);
     _drawPaths(canvas, size);
+    _drawDivergenceOverlay(canvas, size); // before robots/fog so divergence shows under them
     _drawRobots(canvas, size);
     _drawBlockedCells(canvas, size);
     _drawFogOfWar(canvas, size);
@@ -1786,6 +2381,42 @@ class FloorPainter extends CustomPainter {
   // Draws a semi-transparent red fill + orange X on each physically blocked cell.
   // Painted before fog-of-war so the mark is still visible through fog in
   // explored cells, but hidden by fog in unexplored ones.
+
+  // ── Reality/WMS divergence overlay ──────────────────────────────────────
+  // Amber fill + "≠" glyph on cells where Reality qty ≠ WMS qty.
+  // Only shown in Reality schema view, only on explored cells.
+  void _drawDivergenceOverlay(Canvas canvas, Size size) {
+    if (!showRealitySchema || divergentCells.isEmpty) return;
+    final cw = _cw(size);
+    final ch = _ch(size);
+    final fillPaint = Paint()
+      ..color = const Color(0xFFFF8C00).withAlpha(90);
+    final borderPaint = Paint()
+      ..color = const Color(0xFFFF8C00)
+      ..strokeWidth = 1.5
+      ..style = PaintingStyle.stroke;
+
+    for (final key in divergentCells) {
+      final sep = key.indexOf(',');
+      if (sep < 0) continue;
+      final row = int.tryParse(key.substring(0, sep));
+      final col = int.tryParse(key.substring(sep + 1));
+      if (row == null || col == null) continue;
+      if (!_isExplored(row, col)) continue;
+      final rect = Rect.fromLTWH(
+        offset.dx + col * cw,
+        offset.dy + row * ch,
+        cw,
+        ch,
+      );
+      canvas.drawRect(rect, fillPaint);
+      canvas.drawRect(rect, borderPaint);
+      if (scale > 1.0) {
+        _drawTextCentered(canvas, '≠', rect.center, min(cw, ch) * 0.4,
+            color: const Color(0xFFFF8C00));
+      }
+    }
+  }
 
   void _drawBlockedCells(Canvas canvas, Size size) {
     if (blockedCells.isEmpty) return;
@@ -1836,10 +2467,11 @@ class FloorPainter extends CustomPainter {
   // background; the Start Ops overlay covers everything at the widget layer).
 
   void _drawFogOfWar(Canvas canvas, Size size) {
-    if (exploredCells.isEmpty) return; // no scouting started yet
+    if (!fogEnabled) return; // pre-ops: no fog
     final cw = _cw(size);
     final ch = _ch(size);
-    final fogPaint = Paint()..color = const Color(0xFF050A0F);
+    final fogPaint = Paint()
+      ..color = const Color(0xFF1E293B); // slate-800: clearly visible fog
     final rows = warehouseConfig?.rows ?? this.rows;
     final cols = warehouseConfig?.cols ?? this.cols;
     for (int r = 0; r < rows; r++) {
@@ -1911,6 +2543,7 @@ class FloorPainter extends CustomPainter {
       old.robots != robots ||
       old.warehouseConfig != warehouseConfig ||
       old.exploredCells != exploredCells ||
+      old.fogEnabled != fogEnabled ||
       old.activeEvents != activeEvents ||
       old.blinkPhase != blinkPhase ||
       old.scale != scale ||
@@ -2960,8 +3593,9 @@ class FloorPainter extends CustomPainter {
   }
 
   Color _robotColor(Robot robot) {
-    if (robotCargo[robot.id] != null)
+    if (robotCargo[robot.id] != null) {
       return const Color(0xFFFF9800); // amber = carrying pallet
+    }
     return switch (robot.state) {
       'PICKING' => const Color(0xFF00FF88),
       'CHARGING' => const Color(0xFFFFCC00),
@@ -3071,6 +3705,108 @@ class DPadKey extends StatelessWidget {
             size: 22,
           ),
         ),
+      ),
+    );
+  }
+}
+
+// ── Pick / Drop action buttons (shown alongside D-pad) ─────────────────────
+
+class _PickDropButtons extends StatelessWidget {
+  const _PickDropButtons({
+    required this.selectedRobotId,
+    required this.onPick,
+    required this.onDrop,
+  });
+
+  final String? selectedRobotId;
+  final VoidCallback? onPick;
+  final VoidCallback? onDrop;
+
+  @override
+  Widget build(BuildContext context) {
+    final noSel = selectedRobotId == null;
+    const pickColor = Color(0xFF4ADE80);
+    const dropColor = Color(0xFFF97316);
+
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E2A3A).withAlpha(200),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF00D4FF).withAlpha(80)),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withAlpha(100), blurRadius: 12),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            'Actions',
+            style: TextStyle(
+              color: noSel ? Colors.white54 : const Color(0xFF00D4FF),
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 6),
+          // PICK button
+          SizedBox(
+            width: 64,
+            height: 32,
+            child: Material(
+              color: noSel ? Colors.transparent : pickColor.withAlpha(30),
+              borderRadius: BorderRadius.circular(8),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: onPick,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.upload_rounded,
+                        color: noSel ? Colors.white24 : pickColor, size: 14),
+                    const SizedBox(width: 2),
+                    Text('PICK',
+                        style: TextStyle(
+                          color: noSel ? Colors.white24 : pickColor,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        )),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          // DROP button
+          SizedBox(
+            width: 64,
+            height: 32,
+            child: Material(
+              color: noSel ? Colors.transparent : dropColor.withAlpha(30),
+              borderRadius: BorderRadius.circular(8),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: onDrop,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.download_rounded,
+                        color: noSel ? Colors.white24 : dropColor, size: 14),
+                    const SizedBox(width: 2),
+                    Text('DROP',
+                        style: TextStyle(
+                          color: noSel ? Colors.white24 : dropColor,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        )),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

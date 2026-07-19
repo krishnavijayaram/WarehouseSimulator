@@ -7,6 +7,8 @@ import '../models/sim_frame.dart';
 import '../core/api_client.dart';
 import '../core/auth/auth_provider.dart';
 import 'manual_robot_controller.dart';
+import 'inbound_ops_controller.dart';
+import 'pallet_putaway_controller.dart';
 
 /// The currently active (or being-designed) warehouse layout.
 /// Written by the creator screen on Save / Publish;
@@ -139,8 +141,7 @@ class ManualRobotPositionsNotifier
   }
 
   void remove(String robotId) {
-    final next = Map<String, ({int row, int col})>.from(state)
-      ..remove(robotId);
+    final next = Map<String, ({int row, int col})>.from(state)..remove(robotId);
     state = next;
   }
 
@@ -208,30 +209,43 @@ final manualRobotControllerProvider =
 /// The payload is now enriched by the backend with [name] and [functional_type]
 /// so downstream identity checks (e.g. inbound-only menus) work reliably.
 Robot _mapApiRobot(Map<String, dynamic> r, WarehouseConfig config) {
-  final id   = r['robot_id']       as String? ?? '';
-  final name = r['name']           as String? ?? id;
-  final type = r['robot_type']     as String? ?? 'AMR';
-  final ft   = r['functional_type'] as String? ?? '';
+  final id = r['robot_id'] as String? ?? '';
+  final name = r['name'] as String? ?? id;
+  final type = r['robot_type'] as String? ?? 'AMR';
+  final ft = r['functional_type'] as String? ?? '';
   // Derive WS-compatible domain so robot.isInbound works correctly.
   final domain = ft == 'inbound_pick' ? 'INBOUND' : 'ANY';
   return Robot(
-    id:      id,
-    name:    name,
-    type:    type,
-    x:       (r['col'] as num? ?? 0).toDouble(),
-    y:       (r['row'] as num? ?? 0).toDouble(),
-    state:   (r['status'] as String? ?? 'IDLE').toUpperCase(),
+    id: id,
+    name: name,
+    type: type,
+    x: (r['col'] as num? ?? 0).toDouble(),
+    y: (r['row'] as num? ?? 0).toDouble(),
+    state: (r['status'] as String? ?? 'IDLE').toUpperCase(),
     battery: ((r['battery_level'] as num? ?? 100.0) / 100.0).clamp(0.0, 1.0),
-    domain:  domain,
+    domain: domain,
   );
 }
 
-/// Polls live robot positions every 3 s.
+/// True only for the single account allowed to run the LIVE simulator + generate
+/// backend traffic; every other visitor gets a frozen static view. This is the
+/// EX-safety scope gate (one active session can't load the shared Postgres). It
+/// MUST be checked by every polling provider / write path — the earlier version
+/// lived only in floor_screen, so app-wide providers (live robots, inbound
+/// trucks, WMS dashboard, orders) bypassed it and polled for ALL users.
+final isSimOwnerProvider = Provider<bool>((ref) {
+  final auth = ref.watch(authProvider);
+  return auth is AuthLoggedIn && auth.user.isPrivileged;
+});
+
+/// Polls live robot positions every 3 s — OWNER SESSION ONLY.
 /// Rebuilds automatically when [warehouseConfigProvider] changes.
 final liveRobotsProvider =
     StreamProvider.autoDispose<List<Robot>>((ref) async* {
   final config = ref.watch(warehouseConfigProvider);
-  if (config == null) {
+  // EX-safety: non-owners never poll the shared backend — they see the static
+  // spawns/frame instead. Bounds all robot-position polling to one session.
+  if (config == null || !ref.watch(isSimOwnerProvider)) {
     yield const [];
     return;
   }
@@ -321,11 +335,11 @@ class RobotCargoNotifier extends StateNotifier<Map<String, PalletData>> {
       final next = <String, PalletData>{};
       for (final h in holdings) {
         final robotId = h['robot_id'] as String?;
-        final skuId   = h['sku_id']   as String?;
+        final skuId = h['sku_id'] as String?;
         final truckId = h['picked_from_id'] as String?;
         if (robotId != null && skuId != null && skuId.isNotEmpty) {
           next[robotId] = PalletData(
-            skuId:   skuId,
+            skuId: skuId,
             truckId: truckId ?? 'UNKNOWN',
           );
         }
@@ -390,6 +404,20 @@ class StagingNotifier extends StateNotifier<Map<String, StagingSlot>> {
     };
   }
 
+  /// Remove one pallet from a staging slot. If count reaches 0, the slot is removed.
+  void pick(int row, int col) {
+    final k = _key(row, col);
+    final slot = state[k];
+    if (slot == null || slot.count <= 0) return;
+    final next = Map<String, StagingSlot>.from(state);
+    if (slot.count == 1) {
+      next.remove(k);
+    } else {
+      next[k] = StagingSlot(skuId: slot.skuId, count: slot.count - 1);
+    }
+    state = next;
+  }
+
   StagingSlot? slotAt(int row, int col) => state[_key(row, col)];
 }
 
@@ -414,15 +442,16 @@ typedef InboundTruckData = ({
 final inboundTrucksProvider =
     StreamProvider.autoDispose<InboundTruckData>((ref) async* {
   final config = ref.watch(warehouseConfigProvider);
-  if (config == null) {
+  // EX-safety: owner session only — non-owners bypassed the floor_screen gate and
+  // hit yms/trucks + yms/inbound-shipments every 5s for ALL users.
+  if (config == null || !ref.watch(isSimOwnerProvider)) {
     yield (trucks: const [], shipmentsByTruck: const {});
     return;
   }
   while (true) {
     try {
       final trucks = await ApiClient.instance.getInboundTrucks(config.id);
-      final shipments =
-          await ApiClient.instance.getInboundShipments(config.id);
+      final shipments = await ApiClient.instance.getInboundShipments(config.id);
       final byTruck = <String, List<Map<String, dynamic>>>{};
       for (final s in shipments) {
         final tid = s['truck_id'] as String? ?? '';
@@ -438,3 +467,13 @@ final inboundTrucksProvider =
     await Future.delayed(const Duration(seconds: 5));
   }
 });
+
+// ── Inbound ops controller ────────────────────────────────────────────────────
+
+final inboundOpsControllerProvider =
+    StateProvider<InboundOpsController?>((ref) => null);
+
+// ── Pallet putaway controller ─────────────────────────────────────────────────
+
+final palletPutawayControllerProvider =
+    StateProvider<PalletPutawayController?>((ref) => null);

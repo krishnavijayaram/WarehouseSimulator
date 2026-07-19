@@ -22,6 +22,7 @@ import 'screens/chat_screen.dart';
 import 'screens/warehouse_creator_screen.dart';
 import 'models/warehouse_config.dart';
 import 'application/providers.dart';
+import 'application/manual_robot_controller.dart';
 import 'widgets/adaptive_shell.dart';
 
 void main() {
@@ -184,6 +185,13 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     // Watch auth — redirect when state changes
     ref.listen<AuthState>(authProvider, (prev, next) {
       if (next is AuthLoggedIn) {
+        // EX-SAFETY: unlock backend writes for the OWNER session only. This is
+        // the single place the fail-closed ApiClient write guard is opened, tied
+        // to identity rather than to any screen — so no UI path can leak writes
+        // and none has to remember to gate itself. Auth/session writes bypass the
+        // guard by path, so login works for everyone regardless.
+        ApiClient.writesEnabled = next.user.isPrivileged;
+        manualControllerWritesEnabled = next.user.isPrivileged;
         // Start WebSocket when signed in
         ref.read(simFrameProvider.notifier).connect();
         _router.go('/dashboard');
@@ -191,20 +199,76 @@ class _WoisAppState extends ConsumerState<WoisApp> {
         // re-login after a session expiry (AuthLoggedOut → AuthLoggedIn).
         // Skip only if we were already logged in (e.g. token silently refreshed).
         if (prev is! AuthLoggedIn) {
+          // Discard any warehouse config that belongs to a different user
+          // (e.g. loaded from SharedPreferences by the previous session).
+          _clearIfWrongOwner(next.user.id);
           _restoreExplorationState();
         }
       } else if (next is AuthLoggedOut || next is AuthError) {
+        // Re-lock writes on logout so a subsequent non-owner session starts closed.
+        ApiClient.writesEnabled = false;
+        manualControllerWritesEnabled = false;
         ref.read(simFrameProvider.notifier).disconnect();
+        // Clear all in-memory warehouse state so the next user starts clean.
+        _clearWarehouseState();
         _router.go('/login');
       }
     });
 
     return MaterialApp.router(
-      title: 'WOIS — Warehouse AI Sim',
+      title: 'WIOS — Warehouse Intelligence & Operations System',
       debugShowCheckedModeBanner: false,
       theme: _buildTheme(),
       routerConfig: _router,
     );
+  }
+
+  /// Clears all in-memory warehouse + ops state.
+  void _clearWarehouseState() {
+    ref.read(warehouseConfigProvider.notifier).state = null;
+    ref.read(operationsStartedProvider.notifier).state = false;
+    ref.read(exploredCellsProvider.notifier).reset();
+    ref.read(activeEventsProvider.notifier).resolveAll();
+    final sim = ref.read(scoutSimulationProvider);
+    sim?.dispose();
+    ref.read(scoutSimulationProvider.notifier).state = null;
+  }
+
+  /// If a warehouse config is already loaded but its owner doesn't match
+  /// [userId], discard it so the new user gets their own workspace.
+  void _clearIfWrongOwner(String userId) {
+    final cfg = ref.read(warehouseConfigProvider);
+    // 'local' owner = pre-login draft — leave it; publish will stamp the real ID.
+    if (cfg != null &&
+        cfg.ownerId.isNotEmpty &&
+        cfg.ownerId != 'local' &&
+        cfg.ownerId != userId) {
+      debugPrint(
+          '🔄 Clearing warehouse owned by ${cfg.ownerId} for new user $userId');
+      _clearWarehouseState();
+    }
+  }
+
+  /// Fetches the signed-in user's warehouse from the backend when local
+  /// SharedPreferences don't have a config (e.g. first login on this device,
+  /// or after a different user's session was cleared).
+  Future<WarehouseConfig?> _fetchWarehouseFromBackend() async {
+    try {
+      final auth = ref.read(authProvider);
+      if (auth is! AuthLoggedIn) return null;
+      final userId = auth.user.id;
+      final warehouses = await ApiClient.instance.getWarehousesByOwner(userId);
+      if (warehouses.isEmpty) return null;
+      final whId = warehouses.first['id'] as String?;
+      if (whId == null) return null;
+      final detail = await ApiClient.instance.getWarehouseStatus(whId);
+      if (detail == null) return null;
+      final configJson = detail['config_json'] as String?;
+      if (configJson == null || configJson.isEmpty) return null;
+      return WarehouseConfig.fromShareCode(configJson);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Called after auth is confirmed (token set) to restore the fog-of-war and
@@ -221,7 +285,24 @@ class _WoisAppState extends ConsumerState<WoisApp> {
       await Future.delayed(const Duration(milliseconds: 100));
       if (!mounted) return;
     }
+    // Provider is still empty — pref-based restore didn't run (e.g. a
+    // different user's config was cleared by _clearIfWrongOwner).
+    // Try fetching the user's warehouse directly from the backend.
+    if (cfg == null && mounted) {
+      cfg = await _fetchWarehouseFromBackend();
+      if (cfg != null && mounted) {
+        ref.read(warehouseConfigProvider.notifier).state = cfg;
+      }
+    }
     if (cfg == null) return;
+    // EX-safety: the config is loaded above so a non-owner can VIEW the warehouse
+    // statically, but only the owner session restores/writes ops state. This one
+    // gate stops all of the heavy backend work below for everyone else: the
+    // publishWarehouse reseed (a load amplifier that fires on transient DB errors),
+    // the 6-table observation seeds (manualRobotController.initialize), the scout
+    // sim, and the cargo fetch — none of which a static viewer needs.
+    if (!ref.read(isSimOwnerProvider)) return;
+    manualControllerWritesEnabled = true; // owner session may write
     if (ref.read(operationsStartedProvider)) return; // already running
 
     // ── 1. Ensure warehouse row exists in DB ───────────────────────────────
