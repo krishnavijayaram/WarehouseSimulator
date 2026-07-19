@@ -17,7 +17,9 @@ import 'job_board.dart';
 import 'outbound_stage.dart';
 import 'providers.dart';
 import 'sim_random.dart';
+import 'brains/blocker_monitor_brain.dart';
 import 'brains/inbound_robot_brain.dart';
+import 'brains/recovery_robot_brain.dart';
 import 'brains/outbound_order_generator_brain.dart';
 import 'brains/outbound_robot_brain.dart';
 import 'brains/pick_robot_brain.dart';
@@ -31,7 +33,7 @@ typedef SpawnedRobot = ({String id, int row, int col});
 /// One seat in the robot cast. Each `pick` seat is assigned a UOM at bootstrap
 /// from the UOMs the warehouse actually stocks — the Job's UOM gates who may
 /// claim it, so coverage matters (see the note in [bootstrapSimUnits]).
-enum _Slot { inbound, outbound, putaway, pick }
+enum _Slot { inbound, outbound, putaway, pick, recovery }
 
 /// Order dedicated picker seats fill UOMs in. Pallets come LAST on purpose: the
 /// three pallet-class robots (IR, OR, pallet-pick/putaway) already handle pallet
@@ -89,6 +91,7 @@ void bootstrapSimUnits(
     _Slot.pick, // case picker  ─┐ UOM chosen by _pickerUomPriority
     _Slot.pick, // loose picker ─┘
     _Slot.outbound, // 2nd loader — keeps loaders in step with pickers
+    _Slot.recovery, // 7th robot: clears manually-placed blockers to the dump yard
     _Slot.pick, // pallet picker
     _Slot.outbound,
   ];
@@ -121,6 +124,8 @@ void bootstrapSimUnits(
         brain = PickRobotBrain(id: r.id, pos: pos, handledUom: uom);
       case _Slot.outbound:
         brain = OutboundRobotBrain(id: r.id, pos: pos);
+      case _Slot.recovery:
+        brain = RecoveryRobotBrain(id: r.id, pos: pos);
     }
     registry.register(brain);
     positions.update(r.id, r.row, r.col);
@@ -139,6 +144,10 @@ void bootstrapSimUnits(
   final rng = SimRng(ref.read(simSeedProvider));
 
   registry.register(StockMonitorBrain(id: 'stock-monitor', truckSpawn: spawn));
+  // Anomaly loop: the monitor SEES a manually-placed blocker and raises a clear
+  // Job; the recovery unit hauls it to the dump yard. Perception and action stay
+  // separate units coordinating only through the JobBoard.
+  registry.register(BlockerMonitorBrain(id: 'blocker-monitor'));
   registry.register(OutboundOrderGeneratorBrain(
     id: 'order-gen',
     truckSpawn: spawn,

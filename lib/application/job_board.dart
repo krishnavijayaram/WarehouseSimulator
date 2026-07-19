@@ -21,6 +21,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 /// Unit of measure. `loose` is the atomic unit; the others convert to it.
 enum UomKind { pallet, caseUom, loose }
 
+/// Sentinel "unit" that holds a manually-placed blocker's cell in the per-tick
+/// reservation map, so every robot treats the blocker as impassable without any
+/// brain needing its own blocker logic. A recovery unit clears it to the dump.
+const String kBlockerHolderId = '__blocker__';
+
 /// Loose-equivalent conversion. 1 pallet = 12 cases = 48 loose; 1 case = 4 loose.
 const int kLoosePerPallet = 48;
 const int kLoosePerCase = 4;
@@ -220,6 +225,7 @@ enum JobKind {
   putaway,
   rebalance, // rack→rack unwrap (v2 Amendment C: fixes UOM-locked starvation)
   crossDock, // 5.1: an inbound pallet diverted straight to outbound staging
+  clearBlocker, // a manually-placed obstruction: haul it to the dump yard
   pickToStage,
   packAndLoad,
   departTruck,

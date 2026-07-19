@@ -49,6 +49,20 @@ class UnitScheduler {
     // Phase-2 moves can't enter an occupied cell (P6 hard collision arbiter).
     final cellRes = ref.read(cellReservationProvider.notifier);
     cellRes.clear();
+    // A manually placed BLOCKER is a real obstruction, not just an overlay. It is
+    // seeded as a permanent holder of its cell each tick, so ActionApplier.tryStep
+    // refuses to enter it and the brains' existing reroute-on-block logic paths
+    // around it. Doing it here means no brain needs its own blocker awareness —
+    // one place makes every unit respect it. A recovery unit then clears it to the
+    // dump yard (the perceive -> reason -> act loop the JEPA work demonstrates).
+    for (final key in ref.read(blockedCellsProvider)) {
+      final parts = key.split(',');
+      if (parts.length != 2) continue;
+      final r = int.tryParse(parts[0]);
+      final c = int.tryParse(parts[1]);
+      if (r == null || c == null) continue;
+      cellRes.claimFirstFree([(row: r, col: c)], kBlockerHolderId);
+    }
     for (final u in units) {
       cellRes.claimFirstFree([u.pos], u.id);
     }
