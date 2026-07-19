@@ -36,12 +36,24 @@ class RecoveryRobotBrain extends UnitBrain {
   GridPos? _dump;
   bool _carrying = false;
 
+  /// True when the lift also reverted a CellType.obstacle, so a put-back knows to
+  /// restore it. Without this, an aborted haul would restore only half the
+  /// blocker and leave the floor in a state the UI never created.
+  bool _clearedType = false;
+
+
+  /// Blockers as of this tick, consulted by [_walkable]. Refreshed at the top of
+  /// both phases: the PLANNER must agree with the executor that a blocked cell
+  /// is impassable, or A* routes through it and tryStep livelocks forever.
+  Set<(int, int)> _blockedNow = const {};
+
   List<GridPos> _path = const [];
   int _pathIdx = 0;
   int _ticksLeft = 0;
 
   @override
   void perceiveAndDecide(BrainContext ctx) {
+    _blockedNow = blockedCellsFor(ctx.ref);
     if (_state != _RC.idle) return;
     final board = ctx.board;
     for (final job in board.claimableFor(UnitRole.recovery)) {
@@ -51,11 +63,12 @@ class RecoveryRobotBrain extends UnitBrain {
       // blocker AND have somewhere to put it, or the Job just churns.
       final dump = _nearestDump(ctx);
       if (dump == null) continue;
-      final approach = _adjacentWalkable(
-          ctx.config, src.row, src.col, occupiedByOthers(ctx.ref, id));
-      final path = approach == null
-          ? const <GridPos>[]
-          : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
+      // Try EVERY side of the blocker, nearest first, until one is actually
+      // reachable. Taking the first walkable neighbour (always the north one)
+      // sent a unit standing south of the blocker on a route that had to pass
+      // THROUGH it; with two adjacent blockers the chosen side was the other
+      // blocker, and the unit parked one cell short forever.
+      final path = _routeToAnySideOf(ctx, src);
       if (path.isEmpty) {
         board.releaseOrFail(job.id);
         continue;
@@ -76,6 +89,7 @@ class RecoveryRobotBrain extends UnitBrain {
 
   @override
   void act(BrainContext ctx) {
+    _blockedNow = blockedCellsFor(ctx.ref);
     final applier = ActionApplier(ctx.ref, ctx.config);
     switch (_state) {
       case _RC.idle:
@@ -86,6 +100,8 @@ class RecoveryRobotBrain extends UnitBrain {
           _state = _RC.lifting;
           _ticksLeft = kLiftTicks;
           lifecycle = UnitLifecycle.working;
+        } else if (_givenUp) {
+          _abort(ctx); // nothing lifted yet — the blocker stays where it is
         }
 
       case _RC.lifting:
@@ -101,11 +117,24 @@ class RecoveryRobotBrain extends UnitBrain {
             _abort(ctx); // nothing lifted yet — the blocker stays put
             return;
           }
-          // LIFT: this is the moment the floor reopens. The cell leaves the
-          // blocked set, so the scheduler stops reserving it next tick.
+          // LIFT: the moment the floor reopens. A blocker placed through the UI
+          // is a TWO-PART write — CellType.obstacle on the cell AND an entry in
+          // blockedCells — so both halves must be reverted. Clearing only the
+          // blocked set left the obstacle cell type behind, and the "cleared"
+          // cell stayed impassable (obstacle is not walkable).
           ctx.ref
               .read(blockedCellsProvider.notifier)
               .removeLocal(_blocker!.row, _blocker!.col);
+          final cfg = ctx.ref.read(warehouseConfigProvider);
+          final cell = cfg?.cellAt(_blocker!.row, _blocker!.col);
+          if (cfg != null && cell?.type == CellType.obstacle) {
+            _clearedType = true; // remember, so a put-back can restore it
+            ctx.ref.read(warehouseConfigProvider.notifier).state = cfg.setCell(
+                WarehouseCell(
+                    row: _blocker!.row,
+                    col: _blocker!.col,
+                    type: CellType.empty));
+          }
           _carrying = true;
           _path = path;
           _pathIdx = 0;
@@ -118,6 +147,12 @@ class RecoveryRobotBrain extends UnitBrain {
           _state = _RC.dumping;
           _ticksLeft = kDropTicks;
           lifecycle = UnitLifecycle.working;
+        } else if (_givenUp) {
+          // Carrying, but the dump became unreachable. This state previously had
+          // NO failure exit at all, so the unit held the blocker forever. _abort
+          // puts the obstruction BACK where it was, which is safe: the floor
+          // returns to its true state and the monitor can raise a fresh Job.
+          _abort(ctx);
         }
 
       case _RC.dumping:
@@ -131,15 +166,25 @@ class RecoveryRobotBrain extends UnitBrain {
     }
   }
 
+  /// True once the unit has been unable to progress for so long that the Job
+  /// should be given up rather than churned forever. Every sibling brain has this
+  /// escalation; this one lacked it, which is why a stuck recovery unit wedged
+  /// terminally — it never returns to idle, so it could never claim another Job,
+  /// and the live Job suppressed the monitor from re-raising one.
+  static const int kGiveUpTicks = 24;
+
   int _blockedTicks = 0;
+  int _stuckTicks = 0;
   bool _advance(ActionApplier applier) {
     if (_pathIdx < _path.length - 1) {
       if (applier.tryStep(this, _path[_pathIdx + 1])) {
         _pathIdx++;
         _blockedTicks = 0;
+        _stuckTicks = 0;
         return false;
       }
       _blockedTicks++;
+      _stuckTicks++;
       if (_blockedTicks >= 4) {
         final replan = _findPath(applier.config, pos, _path.last,
             occupiedByOthers(applier.ref, id));
@@ -154,14 +199,31 @@ class RecoveryRobotBrain extends UnitBrain {
     return true;
   }
 
-  void _abort(BrainContext ctx) {
-    // If we were already carrying, put the blocker BACK rather than deleting it —
-    // a failed recovery must never silently make an obstruction disappear.
-    if (_carrying && _blocker != null) {
-      ctx.ref
-          .read(blockedCellsProvider.notifier)
-          .addLocal(_blocker!.row, _blocker!.col);
+  /// Blocked for too long to keep trying. Callers abort so the Job's attempts
+  /// counter advances and the seat frees for other work.
+  bool get _givenUp => _stuckTicks > kGiveUpTicks;
+
+  /// Put a lifted blocker BACK, both halves. A failed recovery must never make an
+  /// obstruction silently disappear, and must never leave it half-restored.
+  void _putBack(BrainContext ctx) {
+    if (!_carrying || _blocker == null) return;
+    ctx.ref
+        .read(blockedCellsProvider.notifier)
+        .addLocal(_blocker!.row, _blocker!.col);
+    if (_clearedType) {
+      final cfg = ctx.ref.read(warehouseConfigProvider);
+      if (cfg != null) {
+        ctx.ref.read(warehouseConfigProvider.notifier).state = cfg.setCell(
+            WarehouseCell(
+                row: _blocker!.row,
+                col: _blocker!.col,
+                type: CellType.obstacle));
+      }
     }
+  }
+
+  void _abort(BrainContext ctx) {
+    _putBack(ctx);
     final jid = _jobId;
     if (jid != null) ctx.board.releaseOrFail(jid);
     _reset();
@@ -170,11 +232,7 @@ class RecoveryRobotBrain extends UnitBrain {
 
   @override
   void onReset(BrainContext ctx) {
-    if (_carrying && _blocker != null) {
-      ctx.ref
-          .read(blockedCellsProvider.notifier)
-          .addLocal(_blocker!.row, _blocker!.col);
-    }
+    _putBack(ctx);
     _reset();
   }
 
@@ -185,9 +243,39 @@ class RecoveryRobotBrain extends UnitBrain {
     _blocker = null;
     _dump = null;
     _carrying = false;
+    _clearedType = false;
+    _blockedTicks = 0;
+    _stuckTicks = 0;
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
+  }
+
+  /// A real route to SOME side of [target], trying the nearest side first.
+  /// Returns an empty list when no side is reachable — which correctly surfaces
+  /// the Job to releaseOrFail instead of committing to an unreachable approach.
+  List<GridPos> _routeToAnySideOf(BrainContext ctx, GridPos target) {
+    final occupied = occupiedByOthers(ctx.ref, id);
+    final sides = <GridPos>[];
+    for (final d in const [(-1, 0), (1, 0), (0, -1), (0, 1)]) {
+      final nr = target.row + d.$1;
+      final nc = target.col + d.$2;
+      if (!_walkable(ctx.config, nr, nc)) continue; // skips blocked cells too
+      sides.add((row: nr, col: nc));
+    }
+    sides.sort((a, b) {
+      final da = (a.row - pos.row).abs() + (a.col - pos.col).abs();
+      final db = (b.row - pos.row).abs() + (b.col - pos.col).abs();
+      return da.compareTo(db);
+    });
+    for (final s in sides) {
+      if (s.row == pos.row && s.col == pos.col) {
+        return [pos]; // already standing beside it
+      }
+      final p = _findPath(ctx.config, pos, s, occupied);
+      if (p.length > 1) return p;
+    }
+    return const [];
   }
 
   GridPos? _nearestDump(BrainContext ctx) {
@@ -217,6 +305,7 @@ class RecoveryRobotBrain extends UnitBrain {
   }
 
   bool _walkable(WarehouseConfig cfg, int row, int col) {
+    if (_blockedNow.contains((col, row))) return false;
     if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) return false;
     final t = cfg.cellAt(row, col)?.type ?? CellType.empty;
     return t.isWalkable || t == CellType.empty || t == CellType.dump;

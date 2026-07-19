@@ -104,4 +104,65 @@ void main() {
         (j) => j.kind == JobKind.clearBlocker && !j.settled);
     expect(live, isEmpty, reason: 'the clear Job completes once the blocker is gone');
   });
+
+  testWidgets('recovery starting on the FAR side still clears a real UI blocker',
+      (tester) async {
+    // The review's reproduction. Two defects met here:
+    //  (a) the approach cell was always the first walkable neighbour (north), so
+    //      a unit standing SOUTH had to route through the blocker itself; the
+    //      planner could not see the blocker, so A* returned that path and
+    //      tryStep refused it every tick — a permanent wedge.
+    //  (b) a real UI blocker is a TWO-PART write (CellType.obstacle + blockedCells)
+    //      but the lift reverted only the blocked set, so the cell stayed
+    //      impassable after being "cleared".
+    final config = WarehouseConfig(
+      id: 'blk2',
+      name: 'blk2',
+      ownerId: 'blk2',
+      description: 'far-side',
+      rows: 4,
+      cols: 5,
+      robotSpawns: const [],
+      // Blocker placed the way the UI actually does it: the cell TYPE is obstacle.
+      cells: [
+        WarehouseCell(row: 0, col: 4, type: CellType.dump),
+        WarehouseCell(row: 1, col: 2, type: CellType.obstacle),
+      ],
+    );
+    late WidgetRef ref;
+    await tester.pumpWidget(
+      ProviderScope(
+        child: Consumer(builder: (_, r, __) {
+          ref = r;
+          return const SizedBox();
+        }),
+      ),
+    );
+    ref.read(warehouseConfigProvider.notifier).state = config;
+    ref.read(unitRegistryProvider.notifier)
+      ..register(BlockerMonitorBrain(id: 'MON'))
+      // Starts SOUTH of the blocker — the case that used to wedge.
+      ..register(RecoveryRobotBrain(id: 'RC1', pos: (row: 3, col: 2)));
+    ref.read(blockedCellsProvider.notifier).addLocal(1, 2);
+
+    final scheduler = UnitScheduler(ref);
+    var done = false;
+    for (var t = 0; t < 400 && !done; t++) {
+      scheduler.tick(config, t);
+      done = ref
+          .read(jobBoardProvider)
+          .jobs
+          .values
+          .where((j) => j.kind == JobKind.clearBlocker && !j.settled)
+          .isEmpty;
+      if (t == 0) done = false; // let the monitor raise it first
+    }
+
+    expect(ref.read(blockedCellsProvider).contains('1,2'), isFalse,
+        reason: 'a unit approaching from the far side must still clear it');
+    // BOTH halves reverted — the cell is walkable again, not just un-overlaid.
+    final cellNow = ref.read(warehouseConfigProvider)!.cellAt(1, 2);
+    expect(cellNow?.type, isNot(CellType.obstacle),
+        reason: 'the obstacle cell type must be reverted too, or it still blocks');
+  });
 }

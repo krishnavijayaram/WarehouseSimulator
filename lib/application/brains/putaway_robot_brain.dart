@@ -54,6 +54,12 @@ class PutawayRobotBrain extends UnitBrain {
   // no new truck until the 600-tick stale timeout, and the rack stays empty.
   String? _inboundOrderId;
 
+
+  /// Blockers as of this tick, consulted by [_walkable]. Refreshed at the top of
+  /// both phases: the PLANNER must agree with the executor that a blocked cell
+  /// is impassable, or A* routes through it and tryStep livelocks forever.
+  Set<(int, int)> _blockedNow = const {};
+
   List<GridPos> _path = const [];
   int _pathIdx = 0;
   int _ticksLeft = 0;
@@ -62,6 +68,7 @@ class PutawayRobotBrain extends UnitBrain {
 
   @override
   void perceiveAndDecide(BrainContext ctx) {
+    _blockedNow = blockedCellsFor(ctx.ref);
     if (_state != _PR.idle) return;
     final board = ctx.board;
     for (final job in board.claimableFor(UnitRole.putawayRobot)) {
@@ -191,6 +198,7 @@ class PutawayRobotBrain extends UnitBrain {
 
   @override
   void act(BrainContext ctx) {
+    _blockedNow = blockedCellsFor(ctx.ref);
     final applier = ActionApplier(ctx.ref, ctx.config);
     switch (_state) {
       case _PR.idle:
@@ -506,6 +514,7 @@ class PutawayRobotBrain extends UnitBrain {
   }
 
   bool _walkable(WarehouseConfig cfg, int row, int col) {
+    if (_blockedNow.contains((col, row))) return false;
     if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) return false;
     final t = cfg.cellAt(row, col)?.type ?? CellType.empty;
     return t.isWalkable || t == CellType.empty;

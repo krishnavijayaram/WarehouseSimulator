@@ -33,6 +33,27 @@ Set<(int, int)> occupiedByOthers(WidgetRef ref, String selfId) {
   return out;
 }
 
+/// Manually-placed blockers as `(col, row)` for the A* `walkable` predicate.
+///
+/// HARD, unlike [occupiedByOthers], which is a soft cost. The scheduler makes a
+/// blocked cell impassable to `tryStep`, so the PLANNER must agree: if A* routes
+/// through a blocker the executor refuses that step forever and the unit
+/// livelocks, replanning the same blocked path (it cannot even fail out, because
+/// attempts only increment via releaseOrFail, which movement never calls).
+/// Every brain that paths must AND this into its walkable check.
+Set<(int, int)> blockedCellsFor(WidgetRef ref) {
+  final out = <(int, int)>{};
+  for (final key in ref.read(blockedCellsProvider)) {
+    final parts = key.split(','); // blockedCells keys are 'row,col'
+    if (parts.length != 2) continue;
+    final r = int.tryParse(parts[0]);
+    final c = int.tryParse(parts[1]);
+    if (r == null || c == null) continue;
+    out.add((c, r)); // A* tuples are (col, row)
+  }
+  return out;
+}
+
 /// General lifecycle shared by all units. Role-specific sub-states (e.g. a
 /// truck's `waitingAtBay`) are held privately by that brain.
 enum UnitLifecycle {
