@@ -405,8 +405,15 @@ class _WarehouseCreatorScreenState
     await prefs.setString('warehouse_autosave', cfg.toShareCode());
     // Also persist the draft to the backend if we have a real warehouse ID.
     // Fire-and-forget — UI is never blocked.
+    //
+    // EX-safety: patchWarehouseDraft is a RECURRING backend WRITE (every 30s while
+    // the designer is open) and was ungated for ALL users. Owner session only —
+    // everyone else still gets the local SharedPreferences autosave above, so no
+    // work is lost, but nothing touches the DB shared with EventXplore.
     final id = cfg.id;
-    if (!id.startsWith('local') && id.isNotEmpty) {
+    if (!id.startsWith('local') &&
+        id.isNotEmpty &&
+        ref.read(isSimOwnerProvider)) {
       final auth = ref.read(authProvider);
       final userId = auth is AuthLoggedIn ? auth.user.id : 'local';
       ApiClient.instance

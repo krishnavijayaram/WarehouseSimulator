@@ -30,6 +30,19 @@ import 'package:http/http.dart' as http;
 import '../env.dart';
 import '../models/warehouse_config.dart';
 
+/// EX-SAFETY MASTER SWITCH for every backend write this controller makes.
+///
+/// WIOS shares a Postgres instance with EventXplore's live production, so only
+/// the owner session may write. This is a module-level switch (rather than a
+/// constructor flag) because the controller is deliberately Riverpod-free, and
+/// because gating individual CALL SITES proved fragile — two separate
+/// Start-Operations entry points were each missed in turn.
+///
+/// DEFAULT FALSE = fails CLOSED: a call site that forgets to enable it writes
+/// nothing, instead of silently leaking 6-table observation writes to the shared
+/// DB. Set true only where the session has been confirmed as the sim owner.
+bool manualControllerWritesEnabled = false;
+
 // ── Direction ─────────────────────────────────────────────────────────────────
 
 enum RobotMoveDirection { up, down, left, right }
@@ -412,6 +425,13 @@ class ManualRobotController {
     required double battery,
     required List<Map<String, dynamic>> cells,
   }) {
+    // EX-SAFETY MASTER SWITCH (see [manualControllerWritesEnabled]). Checked at
+    // the WRITE itself rather than at call sites, because call-site gating proved
+    // fragile — two separate Start-Operations entry points (floor_screen and the
+    // desktop shell overlay) were each missed in turn. Default-off means any
+    // forgotten call site fails CLOSED instead of leaking 6-table observation
+    // writes into the Postgres instance shared with EventXplore.
+    if (!manualControllerWritesEnabled) return;
     final payload = jsonEncode({
       'robot_id':      robotId,
       'warehouse_id':  config.id,

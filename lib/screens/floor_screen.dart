@@ -1270,6 +1270,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
           // EX-safety: ManualRobotController seeds + posts 6-table observation
           // WRITES per robot — owner session only.
           if (_isSimOwner) {
+            manualControllerWritesEnabled = true; // owner session may write
             ref.read(manualRobotControllerProvider.notifier).initialize(config);
           }
 

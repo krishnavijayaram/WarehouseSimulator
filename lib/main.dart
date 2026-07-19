@@ -22,6 +22,7 @@ import 'screens/chat_screen.dart';
 import 'screens/warehouse_creator_screen.dart';
 import 'models/warehouse_config.dart';
 import 'application/providers.dart';
+import 'application/manual_robot_controller.dart';
 import 'widgets/adaptive_shell.dart';
 
 void main() {
@@ -291,6 +292,7 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     // the 6-table observation seeds (manualRobotController.initialize), the scout
     // sim, and the cargo fetch — none of which a static viewer needs.
     if (!ref.read(isSimOwnerProvider)) return;
+    manualControllerWritesEnabled = true; // owner session may write
     if (ref.read(operationsStartedProvider)) return; // already running
 
     // ── 1. Ensure warehouse row exists in DB ───────────────────────────────

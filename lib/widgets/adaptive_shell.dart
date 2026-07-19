@@ -3532,9 +3532,16 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   ref.read(activeEventsProvider.notifier).resolveAll();
                   ref.read(blockedCellsProvider.notifier).reset();
                   ref.read(operationsStartedProvider.notifier).state = true;
-                  ref
-                      .read(manualRobotControllerProvider.notifier)
-                      .initialize(config);
+                  // EX-safety: this DESKTOP Start-Operations is a second entry
+                  // point that bypassed the floor_screen gate entirely.
+                  // ManualRobotController seeds 6-table observation WRITES per
+                  // robot — owner session only.
+                  if (ref.read(isSimOwnerProvider)) {
+                    manualControllerWritesEnabled = true; // owner may write
+                    ref
+                        .read(manualRobotControllerProvider.notifier)
+                        .initialize(config);
+                  }
                   // Persist ops-started so fog survives page refresh.
                   SharedPreferences.getInstance().then((prefs) {
                     prefs.setBool('ops_started', true);
