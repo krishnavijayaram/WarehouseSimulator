@@ -192,8 +192,12 @@ class _WoisAppState extends ConsumerState<WoisApp> {
         // guard by path, so login works for everyone regardless.
         ApiClient.writesEnabled = next.user.isPrivileged;
         manualControllerWritesEnabled = next.user.isPrivileged;
-        // Start WebSocket when signed in
-        ref.read(simFrameProvider.notifier).connect();
+        // Start the frame WebSocket for the OWNER session only. Non-owners see a
+        // static view, so a socket (and its reconnect churn against the Azure
+        // gateway) buys them nothing.
+        if (next.user.isPrivileged) {
+          ref.read(simFrameProvider.notifier).connect();
+        }
         _router.go('/dashboard');
         // Restore exploration state on initial app load (AuthLoading) AND on
         // re-login after a session expiry (AuthLoggedOut → AuthLoggedIn).

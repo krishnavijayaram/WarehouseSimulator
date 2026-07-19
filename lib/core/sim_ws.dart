@@ -70,6 +70,9 @@ class SimFrameNotifier extends StateNotifier<SimFrame> {
     if (_ref.read(simConnectionProvider) != SimConnectionState.connected) {
       _setConn(SimConnectionState.connected);
     }
+    // A real frame arrived — the endpoint works, so drop back to the fast retry
+    // for any future blip. Only a genuinely dead endpoint backs off to minutes.
+    _reconnectAttempt = 0;
     try {
       final j = jsonDecode(raw as String) as Map<String, dynamic>;
       state = SimFrame.fromJson(j);
@@ -88,10 +91,29 @@ class SimFrameNotifier extends StateNotifier<SimFrame> {
     _scheduleReconnect();
   }
 
+  // ── Reconnect backoff (Azure cost control) ────────────────────────────────
+  //
+  // This used to retry every 3s forever. When no sim/frame engine is deployed —
+  // which is the normal state in prod, since the automation runs locally — that
+  // is ~20 failed connections a minute, ~28,800 a DAY per open tab, every one of
+  // them hitting the gateway/ingress and billing for it. Exponential backoff
+  // with a ceiling turns that into a few dozen a day, while a session that CAN
+  // connect still recovers quickly because the delay resets on the first frame.
+  static const Duration _kBaseReconnect = Duration(seconds: 3);
+  static const Duration _kMaxReconnect = Duration(minutes: 5);
+  int _reconnectAttempt = 0;
+
   void _scheduleReconnect() {
     if (_disposed) return;
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 3), connect);
+    // 3s, 6s, 12s, 24s … capped at 5 min.
+    final shift = _reconnectAttempt.clamp(0, 8);
+    final ms = _kBaseReconnect.inMilliseconds * (1 << shift);
+    final delay = ms >= _kMaxReconnect.inMilliseconds
+        ? _kMaxReconnect
+        : Duration(milliseconds: ms);
+    _reconnectAttempt++;
+    _reconnectTimer = Timer(delay, connect);
   }
 
   @override
