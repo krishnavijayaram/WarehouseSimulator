@@ -20,22 +20,45 @@ class BlockerMonitorBrain extends UnitBrain {
   BlockerMonitorBrain({required super.id})
       : super(role: UnitRole.stockMonitor, pos: const (row: -1, col: -1));
 
+  /// Cells whose clear Job already exhausted its attempts, with the tick we gave
+  /// up. Without this the monitor re-mints a Job the instant the failed one is
+  /// swept, so an UNSATISFIABLE blocker (unreachable, or no route to a dump)
+  /// churns Jobs forever and kMaxJobAttempts never bounds anything.
+  final Map<String, int> _gaveUpAt = {};
+
+  /// How long to leave an unsatisfiable blocker alone before trying again. Long
+  /// enough to stop churn; short enough that a floor which frees up recovers.
+  static const int kRetryAfterTicks = 600;
+
   @override
   void perceiveAndDecide(BrainContext ctx) {
     final blocked = ctx.ref.read(blockedCellsProvider);
+    // Forget give-ups for cells that are no longer blocked, so the same cell
+    // blocked again later is treated as a fresh anomaly.
+    _gaveUpAt.removeWhere((k, _) => !blocked.contains(k));
     if (blocked.isEmpty) return;
     final board = ctx.board;
 
-    // Cells that already have a live clear Job — don't mint a duplicate.
+    // Cells that already have a live clear Job — don't mint a duplicate. Also
+    // record cells whose Job FAILED, so we can back off instead of re-minting.
     final claimedCells = <String>{};
     for (final j in ctx.ref.read(jobBoardProvider).jobs.values) {
-      if (j.kind != JobKind.clearBlocker || j.settled) continue;
+      if (j.kind != JobKind.clearBlocker) continue;
       final s = j.src;
-      if (s != null) claimedCells.add('${s.row},${s.col}');
+      if (s == null) continue;
+      final key = '${s.row},${s.col}';
+      if (!j.settled) {
+        claimedCells.add(key);
+      } else if (j.status == JobStatus.failed) {
+        _gaveUpAt.putIfAbsent(key, () => ctx.tick);
+      }
     }
 
     for (final key in blocked) {
       if (claimedCells.contains(key)) continue;
+      final gaveUp = _gaveUpAt[key];
+      if (gaveUp != null && ctx.tick - gaveUp < kRetryAfterTicks) continue;
+      if (gaveUp != null) _gaveUpAt.remove(key); // cooled off — try once more
       final parts = key.split(',');
       if (parts.length != 2) continue;
       final r = int.tryParse(parts[0]);

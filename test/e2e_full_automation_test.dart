@@ -48,8 +48,9 @@ WarehouseConfig _fullWarehouse() => WarehouseConfig(
         RobotSpawn(row: 3, col: 0, robotType: 'AMR', name: 'PK-1'),
         RobotSpawn(row: 3, col: 1, robotType: 'AMR', name: 'PK-2'),
         RobotSpawn(row: 3, col: 2, robotType: 'AMR', name: 'PK-3'),
-        // 7th seat = the recovery unit that clears manually-injected blockers.
-        RobotSpawn(row: 3, col: 3, robotType: 'AMR', name: 'RC-1'),
+        // 7th = pallet picker, 8th = the recovery unit that clears blockers.
+        RobotSpawn(row: 3, col: 3, robotType: 'AMR', name: 'PK-4'),
+        RobotSpawn(row: 3, col: 4, robotType: 'AMR', name: 'RC-1'),
       ],
       cells: [
         WarehouseCell(row: 0, col: 1, type: CellType.dock),
@@ -119,7 +120,8 @@ void main() {
       (id: 'PK-1', row: 3, col: 0),
       (id: 'PK-2', row: 3, col: 1),
       (id: 'PK-3', row: 3, col: 2),
-      (id: 'RC-1', row: 3, col: 3),
+      (id: 'PK-4', row: 3, col: 3),
+      (id: 'RC-1', row: 3, col: 4),
     ]);
 
     // Cumulative counters — the board sweeps terminal work, so sample per tick.

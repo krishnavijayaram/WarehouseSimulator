@@ -38,6 +38,9 @@ void main() {
         WarehouseCell(row: 0, col: 7, type: CellType.packStation),
         WarehouseCell(row: 0, col: 8, type: CellType.packStation),
         WarehouseCell(row: 0, col: 9, type: CellType.outbound),
+        // Somewhere to put a cleared obstruction — without it a blocker dropped
+        // on the floor can never be removed.
+        WarehouseCell(row: 5, col: 9, type: CellType.dump),
       ],
       spawns: const [
         RobotSpawn(row: 1, col: 0, robotType: 'AMR'),

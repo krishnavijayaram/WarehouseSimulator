@@ -48,7 +48,14 @@ class ActionApplier {
     final holder = ref.read(cellReservationProvider)['${next.row}_${next.col}'];
     if (holder != null && holder != unit.id) return false;
     final res = ref.read(cellReservationProvider.notifier);
-    res.release(unit.pos.row, unit.pos.col);
+    // Only give up a cell we actually HOLD. A blocker can be dropped onto the
+    // cell a unit is standing on, in which case the sentinel owns it — releasing
+    // it here would evict a live obstruction and let the next robot drive
+    // straight over it (visible on screen as a robot crossing a blocker).
+    final hereKey = '${unit.pos.row}_${unit.pos.col}';
+    if (ref.read(cellReservationProvider)[hereKey] == unit.id) {
+      res.release(unit.pos.row, unit.pos.col);
+    }
     res.claimFirstFree([next], unit.id);
     moveTo(unit, next, drainBattery: drainBattery);
     return true;

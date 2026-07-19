@@ -91,8 +91,10 @@ void bootstrapSimUnits(
     _Slot.pick, // case picker  ─┐ UOM chosen by _pickerUomPriority
     _Slot.pick, // loose picker ─┘
     _Slot.outbound, // 2nd loader — keeps loaders in step with pickers
-    _Slot.recovery, // 7th robot: clears manually-placed blockers to the dump yard
-    _Slot.pick, // pallet picker
+    _Slot.pick, // 7th: PALLET picker — must come before the recovery seat, or
+    //            pallet racks are write-only: putaway keeps filling them, nothing
+    //            drains them, and eventually putaway itself has nowhere to drop.
+    _Slot.recovery, // 8th: clears manually-placed blockers to the dump yard
     _Slot.outbound,
   ];
   // Pickers specialise over the UOMs THIS warehouse actually stocks — not a fixed

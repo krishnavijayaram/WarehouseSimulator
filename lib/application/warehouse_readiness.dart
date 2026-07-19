@@ -73,6 +73,13 @@ List<ReadinessIssue> checkWarehouseReadiness(WarehouseConfig cfg) {
     issues.add(const ReadinessIssue(ReadinessSeverity.warning,
         'Only one pack station — an order\'s pallet/case/loose lines cannot be staged together, and picking stalls behind the single slot. Add 2–3 for a smooth flow.'));
   }
+  // Without a dump yard the recovery loop has nowhere to put an obstruction, so
+  // the monitor stays silent — yet a blocker is still impassable. It would become
+  // a permanent, unclearable obstruction that nothing on the floor can resolve.
+  if (!has((c) => c.type == CellType.dump)) {
+    issues.add(const ReadinessIssue(ReadinessSeverity.warning,
+        'No dump yard — a blocker dropped on the floor can never be cleared (there is nowhere to put it) and stays a permanent obstruction. Add a Dump cell.'));
+  }
   if (!hasStaging) {
     issues.add(const ReadinessIssue(ReadinessSeverity.warning,
         'No pallet staging — inbound unload/putaway has nowhere to drop pallets, so the inbound branch stalls.'));
