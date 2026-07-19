@@ -85,10 +85,18 @@ class PickRobotBrain extends UnitBrain {
           ? const <GridPos>[]
           : _findPath(ctx.config, pos, approach, occupiedByOthers(ctx.ref, id));
       if (src == null || path.isEmpty) {
-        // If stock EXISTS but is merely reserved by another picker, this is
-        // transient — just wait (don't count a failure). Only fail out (DL-3)
-        // when there's genuinely no stock, or the face is unreachable.
-        if (src == null && _hasAnyStock(ctx.config, job.skuId)) {
+        // Transient shortages must WAIT, not fail. Two cases count as transient:
+        //  (a) stock exists but is reserved by another picker, and
+        //  (b) there is no stock YET but an inbound replenishment is in flight —
+        //      a truck is literally on its way with it.
+        // Without (b) the two halves don't run in tandem: outbound kept aborting
+        // orders (8 attempts → Order aborted) for stock that inbound was already
+        // delivering, which is most of the residual failure rate. If the
+        // replenishment itself dies, StockMonitor's stale-order timeout closes it
+        // and this falls through to a real failure, so nothing waits forever.
+        if (src == null &&
+            (_hasAnyStock(ctx.config, job.skuId) ||
+                _replenishInFlight(ctx, job.skuId))) {
           board.release(job.id);
         } else {
           board.releaseOrFail(job.id);
@@ -291,6 +299,21 @@ class PickRobotBrain extends UnitBrain {
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
+  }
+
+  /// An inbound replenishment for [sku] is open/fulfilling — stock is coming, so
+  /// a pick shortage right now is transient and must not burn a failure attempt.
+  /// This is the link that makes the inbound and outbound loops run in tandem.
+  bool _replenishInFlight(BrainContext ctx, String sku) {
+    for (final o in ctx.ref.read(jobBoardProvider).orders.values) {
+      if (o.kind == OrderKind.inboundReplenish &&
+          o.skuId == sku &&
+          (o.status == OrderStatus.open ||
+              o.status == OrderStatus.fulfilling)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// Any rack of this UOM holds stock for [sku] (ignoring reservations) — used

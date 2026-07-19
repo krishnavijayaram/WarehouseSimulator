@@ -52,7 +52,12 @@ WarehouseConfig _fullWarehouse() => WarehouseConfig(
       cells: [
         WarehouseCell(row: 0, col: 1, type: CellType.dock),
         WarehouseCell(row: 0, col: 3, type: CellType.palletStaging),
+        // THREE pack stations: an order routes into up to three UOM lines, so a
+        // single stage cell can never hold a whole order at once — spec-2
+        // "grouped together" is structurally impossible with one.
+        WarehouseCell(row: 0, col: 4, type: CellType.packStation),
         WarehouseCell(row: 0, col: 5, type: CellType.packStation),
+        WarehouseCell(row: 0, col: 6, type: CellType.packStation),
         WarehouseCell(row: 0, col: 7, type: CellType.outbound),
         // Stocked racks — one per UOM so orders can route all three ways.
         WarehouseCell(
