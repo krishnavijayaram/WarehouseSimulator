@@ -48,6 +48,8 @@ WarehouseConfig _fullWarehouse() => WarehouseConfig(
         RobotSpawn(row: 3, col: 0, robotType: 'AMR', name: 'PK-1'),
         RobotSpawn(row: 3, col: 1, robotType: 'AMR', name: 'PK-2'),
         RobotSpawn(row: 3, col: 2, robotType: 'AMR', name: 'PK-3'),
+        // 7th seat = the recovery unit that clears manually-injected blockers.
+        RobotSpawn(row: 3, col: 3, robotType: 'AMR', name: 'RC-1'),
       ],
       cells: [
         WarehouseCell(row: 0, col: 1, type: CellType.dock),
@@ -90,6 +92,8 @@ WarehouseConfig _fullWarehouse() => WarehouseConfig(
             quantity: 0,
             maxQuantity: 10),
         WarehouseCell(row: 4, col: 0, type: CellType.roadH),
+        // Somewhere to put a cleared obstruction.
+        WarehouseCell(row: 4, col: 8, type: CellType.dump),
       ],
     );
 
@@ -115,6 +119,7 @@ void main() {
       (id: 'PK-1', row: 3, col: 0),
       (id: 'PK-2', row: 3, col: 1),
       (id: 'PK-3', row: 3, col: 2),
+      (id: 'RC-1', row: 3, col: 3),
     ]);
 
     // Cumulative counters — the board sweeps terminal work, so sample per tick.
@@ -137,10 +142,28 @@ void main() {
       'PK-1': '3_0', 'PK-2': '3_1', 'PK-3': '3_2',
     };
 
+    // Manually injected obstructions, mid-run, right on the working aisles — the
+    // anomaly the system must notice and rectify WITHOUT the flow seizing up.
+    // Spaced so each has time to be found, hauled to the dump and disposed of
+    // before the next lands — one recovery unit serves them serially.
+    const injections = {200: (1, 4), 500: (3, 5), 800: (1, 6)};
+    final injected = <String>{};
+    final clearedBlockers = <String>{};
+
     final scheduler = UnitScheduler(ref);
     const horizon = 1500;
     for (var t = 0; t < horizon; t++) {
+      final inj = injections[t];
+      if (inj != null) {
+        ref.read(blockedCellsProvider.notifier).addLocal(inj.$1, inj.$2);
+        injected.add('${inj.$1},${inj.$2}');
+      }
       scheduler.tick(config, t);
+      // A blocker counts as cleared once it leaves the blocked set again.
+      final nowBlocked = ref.read(blockedCellsProvider);
+      for (final k in injected) {
+        if (!nowBlocked.contains(k)) clearedBlockers.add(k);
+      }
 
       final board = ref.read(jobBoardProvider);
       // sweepTerminal prunes an Order in the SAME tick it goes terminal, so
@@ -200,7 +223,27 @@ void main() {
     debugPrint('ROBOTS MOVED: ${movedRobots.length}/6 -> ${movedRobots.toList()..sort()}');
     debugPrint('STOCK       : pallet(2,1)=${qty(2, 1)} case(2,3)=${qty(2, 3)} '
         'loose(2,5)=${qty(2, 5)} lowSKU2(2,7)=${qty(2, 7)}');
+    final rc = ref.read(unitRegistryProvider)['RC-1'];
+    final stuckJobs = ref
+        .read(jobBoardProvider)
+        .jobs
+        .values
+        .where((j) => j.kind == JobKind.clearBlocker && !j.settled)
+        .map((j) => '${j.id}:${j.status.name}:att${j.attempts}:src=${j.src}')
+        .toList();
+    debugPrint('BLOCKERS    : injected=${injected.length} '
+        'cleared=${clearedBlockers.length} stillBlocked=${ref.read(blockedCellsProvider)}');
+    debugPrint('RECOVERY    : pos=${rc?.pos} job=${rc?.currentJobId} '
+        'life=${rc?.lifecycle.name} liveClearJobs=$stuckJobs');
     debugPrint('=================================================\n');
+
+    // The anomaly loop must work INSIDE the running warehouse, not just in
+    // isolation: every injected obstruction is found and hauled away, and the
+    // flow keeps producing afterwards rather than seizing up behind it.
+    expect(clearedBlockers.length, injected.length,
+        reason: 'every manually injected blocker must be identified and removed');
+    expect(ref.read(blockedCellsProvider), isEmpty,
+        reason: 'the floor ends clear of obstructions');
 
     // ── ASSERTIONS: each subsystem must actually function ────────────────────
     expect(ordersSeen, isNotEmpty, reason: 'AUTO ORDER: demand must be generated');

@@ -261,6 +261,11 @@ class RecoveryRobotBrain extends UnitBrain {
       final nr = target.row + d.$1;
       final nc = target.col + d.$2;
       if (!_walkable(ctx.config, nr, nc)) continue; // skips blocked cells too
+      // Skip a side another robot is SITTING on. Occupancy is only a soft A*
+      // cost, so without this the planner keeps returning a route to a side that
+      // is physically unenterable — the unit then creeps to the last free cell
+      // and never arrives, so the blocker is never even lifted.
+      if (occupied.contains((nc, nr))) continue;
       sides.add((row: nr, col: nc));
     }
     sides.sort((a, b) {
