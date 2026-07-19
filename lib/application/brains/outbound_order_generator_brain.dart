@@ -140,13 +140,28 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
       }
     }
 
-    ctx.ref.read(unitRegistryProvider.notifier).register(
-          OutboundTruckBrain(
-            id: 'OTRUCK-$id-${_seq++}',
-            pos: truckSpawn,
-            orderId: order.id,
-          ),
-        );
+    // POOL the truck: put this order on an existing truck that still has room,
+    // and only summon a new one when none can take it. One truck per order meant
+    // N trucks competing for a single bay — most never docked before their
+    // seek timeout and aborted their own order (~87% failure in the E2E probe).
+    final registry = ctx.ref.read(unitRegistryProvider.notifier);
+    final units = lines.fold<int>(0, (s, l) => s + l.units);
+    OutboundTruckBrain? host;
+    for (final u in registry.all()) {
+      if (u is OutboundTruckBrain && u.canAccept(ctx, units)) {
+        host = u;
+        break; // deterministic: registry.all() is id-sorted
+      }
+    }
+    if (host != null) {
+      host.addOrder(ctx, order.id);
+    } else {
+      registry.register(OutboundTruckBrain(
+        id: 'OTRUCK-$id-${_seq++}',
+        pos: truckSpawn,
+        orderId: order.id,
+      ));
+    }
 
     _nextEmitAtTick = ctx.tick + rng.jitter(emitEveryTicks, emitJitterTicks);
   }

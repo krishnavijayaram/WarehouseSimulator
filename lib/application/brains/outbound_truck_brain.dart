@@ -16,25 +16,67 @@ import 'unit_brain.dart';
 
 enum _OT { seekingBay, driving, docked, departing }
 
+/// One outbound truck holds 10 pallets (loose-equivalent). Many orders share a
+/// truck; it departs when everything aboard is loaded (or it has dwelled too
+/// long), which is what stops a 1:1 truck-per-order from swamping the bays.
+const int kOutboundTruckCapacityUnits = 10 * kLoosePerPallet; // 480
+
 class OutboundTruckBrain extends UnitBrain {
   OutboundTruckBrain({
     required super.id,
     required super.pos,
-    required this.orderId,
+    required String orderId,
+    this.capacityUnits = kOutboundTruckCapacityUnits,
     GridPos? exit,
-  })  : _exit = exit,
+  })  : _orders = [orderId],
+        _exit = exit,
         super(role: UnitRole.outboundTruck);
 
-  final String orderId;
+  /// Every Order aboard. One truck serves MANY orders — with one truck per order
+  /// and a single bay, most trucks never docked before kMaxSeekTicks and aborted
+  /// their Order (an ~87% order failure rate in the E2E probe).
+  final List<String> _orders;
+  final int capacityUnits;
   final GridPos? _exit;
 
+  List<String> get orders => List.unmodifiable(_orders);
+
   static const int kMaxSeekTicks = 120;
+
+  /// Never hold a bay forever: if the floor stops delivering, leave with what we
+  /// have so the next truck can dock.
+  static const int kMaxDwellTicks = 500;
 
   _OT _state = _OT.seekingBay;
   GridPos? _bay;
   int _seekTicks = 0;
+  int _dwellTicks = 0;
   List<GridPos> _path = const [];
   int _pathIdx = 0;
+
+  /// Loose-equivalent already promised to this truck.
+  int committedUnits(BrainContext ctx) {
+    final board = ctx.ref.read(jobBoardProvider).orders;
+    var total = 0;
+    for (final oid in _orders) {
+      total += board[oid]?.orderedUnits ?? 0;
+    }
+    return total;
+  }
+
+  /// Still loading and has room for [units] more.
+  bool canAccept(BrainContext ctx, int units) =>
+      _state != _OT.departing &&
+      committedUnits(ctx) + units <= capacityUnits;
+
+  /// Put another Order aboard, publishing the bay if we are already docked.
+  void addOrder(BrainContext ctx, String orderId) {
+    if (_orders.contains(orderId)) return;
+    _orders.add(orderId);
+    if (_state == _OT.docked && _bay != null) {
+      ctx.board.setShipBay(orderId, _bay);
+    }
+  }
 
   @override
   void perceiveAndDecide(BrainContext ctx) {
@@ -67,9 +109,11 @@ class OutboundTruckBrain extends UnitBrain {
       case _OT.seekingBay:
         lifecycle = UnitLifecycle.idle;
         if (++_seekTicks > kMaxSeekTicks) {
-          // Couldn't get a bay in time → abort the Order so the generator's WIP
-          // slot frees instead of the whole outbound loop wedging (review HT-2).
-          ctx.board.closeOrder(orderId, aborted: true);
+          // Couldn't get a bay in time → abort what we carry so the generator's
+          // WIP slots free instead of the outbound loop wedging (review HT-2).
+          for (final oid in _orders) {
+            ctx.board.closeOrder(oid, aborted: true);
+          }
           ctx.ref.read(unitRegistryProvider.notifier).remove(id);
         }
 
@@ -77,18 +121,30 @@ class OutboundTruckBrain extends UnitBrain {
         if (_advance(applier)) {
           _state = _OT.docked;
           lifecycle = UnitLifecycle.working;
-          // Publish the bay (through the notifier, HT-6) so pack/load can find us.
-          ctx.board.setShipBay(orderId, _bay);
+          // Publish the bay (through the notifier, HT-6) so pack/load can find us
+          // — for EVERY order aboard, not just the first.
+          for (final oid in _orders) {
+            ctx.board.setShipBay(oid, _bay);
+          }
         }
 
       case _OT.docked:
-        final order = ctx.ref.read(jobBoardProvider).orders[orderId];
-        // Order gone (closed + swept), fully loaded, or ABORTED (its pick failed
-        // out — review DL-3) → ship out so the bay is never leaked.
-        if (order == null ||
-            order.isSatisfied ||
-            order.status == OrderStatus.aborted) {
-          ctx.board.setShipBay(orderId, null); // clear the handoff (HT-5/HT-6)
+        _dwellTicks++;
+        final boardOrders = ctx.ref.read(jobBoardProvider).orders;
+        // Anything aboard still waiting to be loaded?
+        final stillLoading = _orders.any((oid) {
+          final o = boardOrders[oid];
+          return o != null &&
+              !o.isSatisfied &&
+              o.status != OrderStatus.aborted;
+        });
+        // Depart when everything aboard is loaded (or gone), or we have dwelled
+        // too long — the timeout is what stops a half-full truck holding the bay
+        // forever and starving every following order.
+        if (!stillLoading || _dwellTicks > kMaxDwellTicks) {
+          for (final oid in _orders) {
+            ctx.board.setShipBay(oid, null); // clear the handoff (HT-5/HT-6)
+          }
           ctx.ref
               .read(bayOccupancyProvider.notifier)
               .release(_bay!.row, _bay!.col);
