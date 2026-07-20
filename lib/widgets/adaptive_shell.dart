@@ -596,8 +596,24 @@ class _DataTabs extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Live robots from DB (polls every 3 s); falls back to empty list.
-    final robots = ref.watch(liveRobotsProvider).valueOrNull ?? const [];
+    // Prefer the LOCAL autonomous sim's robots (the ones actually moving) over
+    // the backend DB list, which in prod is stale/engine-less and showed frozen
+    // "SCOUTING" robots at off-grid positions. Fall back to the DB list only
+    // before the local sim has seeded any positions.
+    final localPos = ref.watch(manualRobotPositionsProvider);
+    final robots = localPos.isNotEmpty
+        ? localPos.entries
+            .map((e) => Robot(
+                  id: e.key,
+                  name: e.key,
+                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  x: e.value.col.toDouble(),
+                  y: e.value.row.toDouble(),
+                  state: 'MOVING',
+                  battery: 1.0,
+                ))
+            .toList()
+        : (ref.watch(liveRobotsProvider).valueOrNull ?? const []);
     final truckData = ref.watch(inboundTrucksProvider);
     final inboundTrucks = truckData.valueOrNull?.trucks ?? const [];
     final shipmentsByTruck =
@@ -3061,8 +3077,12 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   .toList() ??
               []);
       if (manualPositions.isNotEmpty) {
-        final manualIds = manualPositions.keys.toSet();
-        final overrides = manualPositions.entries
+        // The LOCAL autonomous sim is authoritative — render ONLY its robots.
+        // Automation runs client-side; there is no sim engine in prod, so the
+        // backend WS frame (frame.robots) holds STALE, immovable robots at bogus
+        // positions (e.g. row 24 off-grid). Layering those in painted frozen
+        // robots on top of the moving ones — the "robots never move" symptom.
+        displayRobots = manualPositions.entries
             .map((e) => Robot(
                   id: e.key,
                   name: e.key,
@@ -3073,10 +3093,6 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   battery: 1.0,
                 ))
             .toList();
-        displayRobots = [
-          ...base.where((r) => !manualIds.contains(r.id)),
-          ...overrides,
-        ];
       } else {
         displayRobots = base;
       }
