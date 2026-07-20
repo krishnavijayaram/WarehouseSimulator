@@ -185,7 +185,10 @@ class ManualRobotController {
 
   void _seedInitialReveal() {
     for (final r in _robots.values) {
-      _revealAround(r.row, r.col);
+      // Do NOT reveal fog here. Fog is a robot's CAMERA/SCANNER — it must unwrap
+      // ONLY when the robot physically moves (ActionApplier.moveTo -> revealFog).
+      // Revealing a 3x3 around a stationary spawn made the warehouse "unwrap
+      // itself" with no robot moving, which is physically wrong for the sim.
       // Send initial observation to backend (robot "powers on" at spawn).
       _postObservation(
         robotId: r.robotId,

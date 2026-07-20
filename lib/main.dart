@@ -2,7 +2,6 @@
 library;
 
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -335,10 +334,12 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     try {
       final cells = await ApiClient.instance.getExploredCells(cfg.id);
       if (cells.isNotEmpty && mounted) {
-        final exploredN = ref.read(exploredCellsProvider.notifier);
-        for (final cell in cells) {
-          exploredN.markExplored(cell[0], cell[1]);
-        }
+        // Do NOT bulk-replay explored cells into the fog. Fog must unwrap ONLY
+        // from live robot movement (a robot's camera), or the warehouse appears
+        // to "unwrap itself" on refresh with no robot moving. We still use the
+        // presence of prior exploration to know ops were running, then let the
+        // restarted sim re-reveal the map live as robots drive.
+        ref.read(exploredCellsProvider.notifier).reset();
         ref.read(simulationModeProvider.notifier).state = 'automated';
         ref.read(operationsStartedProvider.notifier).state = true;
         ref.read(manualRobotControllerProvider.notifier).initialize(cfg);
@@ -363,24 +364,12 @@ class _WoisAppState extends ConsumerState<WoisApp> {
     if (!wasStarted || opsWhId != cfg.id) return;
     if (!mounted) return;
 
-    // Restore explored cells saved by the last 30-second flush.
-    final localJson = prefs.getString('explored_cells_${cfg.id}');
-    if (localJson != null) {
-      try {
-        final keys = (jsonDecode(localJson) as List).cast<String>();
-        final exploredN = ref.read(exploredCellsProvider.notifier);
-        for (final key in keys) {
-          final parts = key.split(',');
-          if (parts.length == 2) {
-            final r = int.tryParse(parts[0]);
-            final c = int.tryParse(parts[1]);
-            if (r != null && c != null) exploredN.markExplored(r, c);
-          }
-        }
-      } catch (_) {
-        // Corrupt cache — start fresh.
-      }
-    }
+    // Do NOT bulk-replay the saved explored cells into the fog. Fog is the
+    // robot's live camera/scanner — it must unwrap ONLY as a robot physically
+    // moves (ActionApplier.moveTo -> revealFog). Replaying the snapshot made the
+    // warehouse appear "already unwrapped" on refresh with no robot moving.
+    // Start with black fog and let the restarted sim re-reveal the map live.
+    ref.read(exploredCellsProvider.notifier).reset();
 
     ref.read(simulationModeProvider.notifier).state = 'automated';
     ref.read(operationsStartedProvider.notifier).state = true;

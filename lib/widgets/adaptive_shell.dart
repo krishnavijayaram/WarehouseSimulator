@@ -2032,14 +2032,16 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
     )..repeat(reverse: true);
     _blinkAnim = CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut);
     // Re-launch the simulation if FloorCanvas mounts while ops are already
-    // running but there is no active sim (e.g. user navigated away and back).
-    // Only creates a new sim when one doesn't exist — avoids disposing a
-    // running simulation on every rebuild.
+    // running but the sim is missing OR dead (e.g. user navigated away and
+    // back, or a restored/returning session left a non-null but stopped sim).
+    // Relaunching a still-running sim would dispose it, so we ONLY relaunch
+    // when it is absent or not running — never on top of a live one.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final config = ref.read(warehouseConfigProvider);
+      final sim = ref.read(scoutSimulationProvider);
       if (ref.read(operationsStartedProvider) &&
-          ref.read(scoutSimulationProvider) == null &&
+          (sim == null || sim.isRunning != true) &&
           config != null) {
         _launchSimulation(config);
       }
@@ -3059,23 +3061,25 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
               ))
           .toList();
     } else {
-      // Automated mode (or manual before any D-pad moves): start from WS frame
-      // / spawns, then overlay any robots the user has manually moved via D-pad
-      // so inbound manual ops (unload / drop) remain available in auto mode.
-      final base = frame.robots.isNotEmpty
-          ? frame.robots
-          : (config?.robotSpawns
-                  .map((s) => Robot(
-                        id: s.name ?? s.robotType,
-                        name: s.name ?? s.robotType,
-                        type: s.robotType,
-                        x: s.col.toDouble(),
-                        y: s.row.toDouble(),
-                        state: 'IDLE',
-                        battery: 1.0,
-                      ))
-                  .toList() ??
-              []);
+      // Automated mode (or manual before any D-pad moves): base is ALWAYS the
+      // static spawn placeholders — NEVER frame.robots. Automation runs
+      // client-side; there is no sim engine in prod, so the backend WS frame
+      // holds STALE, immovable robots at bogus positions (e.g. row 24 off-grid).
+      // Painting those produced the "robots never move" symptom. Spawns are only
+      // a placeholder shown until the local sim seeds manualRobotPositions on its
+      // first tick, after which the moving local robots take over entirely.
+      final base = config?.robotSpawns
+              .map((s) => Robot(
+                    id: s.name ?? s.robotType,
+                    name: s.name ?? s.robotType,
+                    type: s.robotType,
+                    x: s.col.toDouble(),
+                    y: s.row.toDouble(),
+                    state: 'IDLE',
+                    battery: 1.0,
+                  ))
+              .toList() ??
+          [];
       if (manualPositions.isNotEmpty) {
         // The LOCAL autonomous sim is authoritative — render ONLY its robots.
         // Automation runs client-side; there is no sim engine in prod, so the

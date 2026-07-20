@@ -69,10 +69,26 @@
         _reloadedForSW = true;
         window.location.reload();
       });
-      // Drop any existing registration so the next load fetches fresh from the
-      // server rather than from a stale cache.
+      // This app needs NO offline caching, and a stale service worker was the
+      // root cause of a deploy serving old JS (new index.html, old app code) so
+      // the running simulator used old logic and robots never moved. FULLY
+      // unregister every worker and purge all caches, then reload once if a
+      // worker had been controlling this page — guaranteeing the freshest build
+      // is served after every deploy.
       navigator.serviceWorker.getRegistrations().then(function (regs) {
-        regs.forEach(function (r) { r.update(); });
+        var hadController = !!navigator.serviceWorker.controller;
+        var jobs = regs.map(function (r) { return r.unregister(); });
+        if (window.caches && caches.keys) {
+          jobs.push(caches.keys().then(function (keys) {
+            return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+          }));
+        }
+        Promise.all(jobs).then(function () {
+          if (hadController && !_reloadedForSW) {
+            _reloadedForSW = true;
+            window.location.reload();
+          }
+        }).catch(function () {});
       }).catch(function () {});
     }
   </script>
