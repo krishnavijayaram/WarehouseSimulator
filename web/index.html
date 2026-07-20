@@ -52,6 +52,31 @@
     };
   </script>
   <!--
+    CACHE FIX. Flutter's default service worker kept serving a STALE build after a
+    deploy: the new index.html loaded (so the UI/mode changed) but the old app JS
+    stayed cached, so the running simulator used old logic and robots never moved
+    even though the shipped code was correct. This app needs no offline caching,
+    so we auto-reload when a new service worker takes control, and clear any
+    existing registration, guaranteeing the latest build is used after a deploy.
+  -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      // Reload once a newly-installed worker takes over, so a fresh deploy is
+      // picked up automatically instead of staying stale until a hard refresh.
+      var _reloadedForSW = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (_reloadedForSW) return;
+        _reloadedForSW = true;
+        window.location.reload();
+      });
+      // Drop any existing registration so the next load fetches fresh from the
+      // server rather than from a stale cache.
+      navigator.serviceWorker.getRegistrations().then(function (regs) {
+        regs.forEach(function (r) { r.update(); });
+      }).catch(function () {});
+    }
+  </script>
+  <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader
     or to give the user feedback during the initialization process.
