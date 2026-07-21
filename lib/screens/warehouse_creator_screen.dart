@@ -3503,8 +3503,10 @@ class _StartOpsDialog extends ConsumerStatefulWidget {
 
 class _StartOpsDialogState extends ConsumerState<_StartOpsDialog> {
   void _launch() {
-    // Always manual: robots are driven by D-pad, one cell at a time.
-    ref.read(simulationModeProvider.notifier).state = 'manual';
+    // Automated: the autonomous brains drive the robots, so Start Operations
+    // shows a MOVING floor (not static spawns waiting for D-pad STEPs). Manual
+    // D-pad control is still reachable via the mode toggle.
+    ref.read(simulationModeProvider.notifier).state = 'automated';
 
     // Reset fog-of-war and events.
     ref.read(exploredCellsProvider.notifier).reset();
@@ -3527,19 +3529,19 @@ class _StartOpsDialogState extends ConsumerState<_StartOpsDialog> {
     // The notifier holds a stable Ref — no stale-ref issues.
     ref.read(manualRobotControllerProvider.notifier).initialize(widget.config);
 
-    // Create the scout simulation so the STEP button and the 30-second
-    // backend flush work, but keep it paused — bots only move when the
-    // user presses STEP (manual mode).
+    // Create the scout simulation and START it (automated): the 400ms tick loop
+    // registers the autonomous brains and drives the robots. backendSync:false
+    // keeps it client-only — it must never write to the shared backend (EX-safe).
     final prevSim = ref.read(scoutSimulationProvider);
     prevSim?.dispose();
     final scout = RobotScoutSimulation(
       config: widget.config,
       ref: ref,
       isSaboteur: false,
+      backendSync: false,
     );
     ref.read(scoutSimulationProvider.notifier).state = scout;
-    // Manual mode: never create the step timer — robots only move via STEP.
-    scout.startManual();
+    scout.start();
 
     // Navigate to Floor tab.
     ref.read(navigateToTabProvider.notifier).state = 1;

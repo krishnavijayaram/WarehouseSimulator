@@ -145,6 +145,18 @@ class OutboundTruckBrain extends UnitBrain {
         // forever and starving every following order.
         if (!stillLoading || _dwellTicks > kMaxDwellTicks) {
           for (final oid in _orders) {
+            // Any order still aboard that we did NOT finish loading is orphaned
+            // by our departure: its packAndLoad becomes unclaimable the moment
+            // shipBay goes null, so it can never satisfy, never fail out, and
+            // pins a WIP slot forever — the generator's wipCap then stops all new
+            // demand (the ~2-3/20 shipping ceiling). Abort it so its slot frees
+            // and _reclaimDeadOrderStage reclaims its staged pallet.
+            final o = boardOrders[oid];
+            if (o != null &&
+                !o.isSatisfied &&
+                o.status != OrderStatus.aborted) {
+              ctx.board.closeOrder(oid, aborted: true);
+            }
             ctx.board.setShipBay(oid, null); // clear the handoff (HT-5/HT-6)
           }
           ctx.ref

@@ -434,16 +434,16 @@ class _ManualModeBar extends ConsumerWidget {
 // TICKER STRIP
 // ══════════════════════════════════════════════════════════════════════════════
 
-class _TickerStrip extends StatefulWidget {
+class _TickerStrip extends ConsumerStatefulWidget {
   const _TickerStrip({required this.frame, this.isManual = false});
   final SimFrame frame;
   final bool isManual;
 
   @override
-  State<_TickerStrip> createState() => _TickerStripState();
+  ConsumerState<_TickerStrip> createState() => _TickerStripState();
 }
 
-class _TickerStripState extends State<_TickerStrip>
+class _TickerStripState extends ConsumerState<_TickerStrip>
     with SingleTickerProviderStateMixin {
   late AnimationController _anim;
   late Animation<double> _pos;
@@ -467,6 +467,17 @@ class _TickerStripState extends State<_TickerStrip>
   Widget build(BuildContext context) {
     final kpi = widget.frame.kpi;
     final effPct = (kpi.efficiency * 100).round();
+    // BOTS + STATUS come from the LOCAL sim, not the backend WS frame. In prod
+    // there is no sim-engine WebSocket, so widget.frame is a dead placeholder that
+    // would ALWAYS read STATUS=STOPPED / BOTS=0 no matter what the running local
+    // simulation is doing — the exact "STOPPED / 0 while robots are on the floor"
+    // contradiction. Derive them from the local sim + unit registry instead.
+    final sim = ref.watch(scoutSimulationProvider);
+    final registry = ref.watch(unitRegistryProvider);
+    final botCount = registry.values.where((u) => u.isChargeable).length;
+    final status = sim == null
+        ? 'STOPPED'
+        : (sim.isRunning ? 'RUNNING' : 'PAUSED');
     final items = [
       'WMS 98%',
       'OMS 95%',
@@ -475,9 +486,9 @@ class _TickerStripState extends State<_TickerStrip>
       'SMS 96%',
       'ALERTS: ${kpi.conflicts}',
       'EFF: $effPct%',
-      'BOTS: ${kpi.activeBots}',
+      'BOTS: $botCount',
       'WAVE #${widget.frame.waveNumber}',
-      'STATUS: ${widget.frame.simStatus}',
+      'STATUS: $status',
     ];
     final text = items.join('    ◈    ');
 
