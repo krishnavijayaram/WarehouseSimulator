@@ -3022,6 +3022,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
     final simMode = ref.watch(simulationModeProvider);
     final sim = ref.watch(scoutSimulationProvider);
     final manualPositions = ref.watch(manualRobotPositionsProvider);
+    final registryUnits = ref.watch(unitRegistryProvider);
     final selectedRobotId = ref.watch(selectedRobotIdProvider);
     final manualCtrl = ref.watch(manualRobotControllerProvider);
 
@@ -3080,13 +3081,17 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                   ))
               .toList() ??
           [];
-      if (manualPositions.isNotEmpty) {
-        // The LOCAL autonomous sim is authoritative — render ONLY its robots.
-        // Automation runs client-side; there is no sim engine in prod, so the
-        // backend WS frame (frame.robots) holds STALE, immovable robots at bogus
-        // positions (e.g. row 24 off-grid). Layering those in painted frozen
-        // robots on top of the moving ones — the "robots never move" symptom.
-        displayRobots = manualPositions.entries
+      // Render ONLY robots that are CURRENTLY-REGISTERED live units. Filtering by
+      // the unit registry drops every stale render-map entry that otherwise piles
+      // up as a "blast" of frozen ghost robots: departed trucks, leftovers still
+      // in manualRobotPositions after the sim STOPPED (registry cleared but the
+      // render map is not), and backend robots that were never registered. When
+      // nothing live is tracked (e.g. stopped), fall back to the static spawns.
+      final live = manualPositions.entries
+          .where((e) => registryUnits.containsKey(e.key))
+          .toList();
+      if (live.isNotEmpty) {
+        displayRobots = live
             .map((e) => Robot(
                   id: e.key,
                   name: e.key,
@@ -3180,7 +3185,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                     //   moving>0      -> they ARE moving; a render issue if unseen
                     if (opsStarted)
                       Positioned(
-                        top: 6,
+                        bottom: 6,
                         left: 6,
                         child: Builder(builder: (_) {
                           final sim = ref.watch(scoutSimulationProvider);
@@ -3192,7 +3197,9 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                                   '${s.row}_${s.col}'
                           };
                           var moving = 0;
+                          var shown = 0; // rendered = tracked ∩ live registry
                           pos.forEach((id, p) {
+                            if (units.containsKey(id)) shown++;
                             final h = spawnHome[id];
                             if (h != null && '${p.row}_${p.col}' != h) moving++;
                           });
@@ -3205,7 +3212,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                               'run=${sim?.isRunning == true ? "yes" : "no"} '
                               'tick=${sim?.tickNo ?? 0} '
                               'units=${units.length} '
-                              'tracked=${pos.length} moving=$moving',
+                              'tracked=${pos.length} shown=$shown moving=$moving',
                               style: const TextStyle(
                                   fontSize: 11,
                                   color: Color(0xFF39FF14),
