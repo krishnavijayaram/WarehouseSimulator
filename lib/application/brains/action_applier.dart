@@ -41,6 +41,17 @@ class ActionApplier {
     }
   }
 
+  /// Remove a unit from the world entirely: unschedule it (registry) AND clear
+  /// its rendered cell (manualRobotPositionsProvider). Truck brains used to clear
+  /// only the registry on departure, leaking a stale entry keyed by their unique
+  /// TRUCK-…-N / OTRUCK-…-N id that was never overwritten or removed — so every
+  /// departed truck stayed painted at its exit (col 0) / bay, accumulating an
+  /// unbounded "blast" of ghost robots over a run. Both removals are idempotent.
+  void despawn(UnitBrain unit) {
+    ref.read(unitRegistryProvider.notifier).remove(unit.id);
+    ref.read(manualRobotPositionsProvider.notifier).remove(unit.id);
+  }
+
   /// Move one cell IF it's free this tick — the P6 hard collision guard. Returns
   /// false (the unit holds in place) when [next] is already reserved by another
   /// unit; on success it hands off the reservation from the old cell to [next].

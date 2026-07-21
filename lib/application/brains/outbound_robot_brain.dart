@@ -154,6 +154,11 @@ class OutboundRobotBrain extends UnitBrain {
           _pathIdx = 0;
         }
       } else if (_blockedTicks >= 8) {
+        // Head-on: back out to a free side cell IF the goal stays reachable from
+        // there, so the opposing unit can pass (P6 back-out). A per-tick head-on
+        // yield was tried (deterministic id tie-break) but made robots hold cells
+        // longer, slowing blocker recovery below the e2e budget — reverted; the
+        // ghost-truck despawn fix removes the visible "stuck" robots on its own.
         final side = _adjacentWalkable(
             applier.config, pos.row, pos.col, occupiedByOthers(applier.ref, id));
         if (side != null &&

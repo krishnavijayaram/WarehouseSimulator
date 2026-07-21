@@ -88,7 +88,7 @@ class InboundTruckBrain extends UnitBrain {
           // can't accumulate, and abort the replenish Order so StockMonitor's
           // inFlight slot frees for a fresh attempt.
           if (orderId != null) ctx.board.closeOrder(orderId!, aborted: true);
-          ctx.ref.read(unitRegistryProvider.notifier).remove(id);
+          applier.despawn(this);
         }
 
       case _IT.driving:
@@ -125,7 +125,7 @@ class InboundTruckBrain extends UnitBrain {
       case _IT.departing:
         if (_advance(applier)) {
           // Gone: remove from the registry so it stops being scheduled.
-          ctx.ref.read(unitRegistryProvider.notifier).remove(id);
+          applier.despawn(this);
         }
     }
   }

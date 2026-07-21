@@ -116,7 +116,7 @@ class OutboundTruckBrain extends UnitBrain {
           for (final oid in _orders) {
             ctx.board.closeOrder(oid, aborted: true);
           }
-          ctx.ref.read(unitRegistryProvider.notifier).remove(id);
+          applier.despawn(this);
         }
 
       case _OT.driving:
@@ -161,7 +161,7 @@ class OutboundTruckBrain extends UnitBrain {
 
       case _OT.departing:
         if (_advance(applier)) {
-          ctx.ref.read(unitRegistryProvider.notifier).remove(id);
+          applier.despawn(this);
         }
     }
   }
