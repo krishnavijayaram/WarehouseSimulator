@@ -21,10 +21,19 @@ class StockMonitorBrain extends UnitBrain {
     required super.id,
     required this.truckSpawn,
     this.reorderUnits = kLoosePerPallet,
+    this.maxConcurrentInbound = 4,
   }) : super(role: UnitRole.stockMonitor, pos: const (row: -1, col: -1));
 
   /// Where spawned trucks appear on the yard.
   final GridPos truckSpawn;
+
+  /// Global cap on simultaneously-open inbound replenish Orders. Without it, a
+  /// warehouse with many low racks (e.g. a freshly-seeded one) summons a truck
+  /// for EVERY low SKU on the same tick — dozens of trucks saturate every bay
+  /// (inbound trucks even squat the outbound bays), unload work backs up, and the
+  /// whole loop clogs with EFF 0. The cap replenishes low SKUs a few at a time as
+  /// bays free, so inbound can never flood outbound out of its own bays.
+  final int maxConcurrentInbound;
 
   /// Legacy knob: a floor on how much a replenishment requests (loose-equiv).
   /// Order size is now DERIVED from the truck manifest so the two can never
@@ -53,9 +62,19 @@ class StockMonitorBrain extends UnitBrain {
         o.skuId == sku &&
         (o.status == OrderStatus.open || o.status == OrderStatus.fulfilling));
 
+    // How many inbound trucks are already on the floor — the flood cap. Trucks
+    // occupy bays and outlive their order while departing, so bounding the TRUCK
+    // count (not just open orders) is what keeps inbound from saturating every bay
+    // and squeezing outbound out of its own bays.
+    var liveInboundTrucks = 0;
+    for (final u in ctx.ref.read(unitRegistryProvider).values) {
+      if (u is InboundTruckBrain) liveInboundTrucks++;
+    }
+
     // 1) Trigger: a SKU low on the racks with nothing already coming.
     final seen = <String>{};
     for (final c in cfg.cells) {
+      if (liveInboundTrucks >= maxConcurrentInbound) break; // don't flood the bays
       if (!c.type.isRack) continue;
       final sku = c.skuId;
       if (sku == null || sku.isEmpty || !c.needsReplenishment) continue;
@@ -85,6 +104,7 @@ class StockMonitorBrain extends UnitBrain {
               orderId: order.id, // thread orderId so putaway advances it (AC-2)
             ),
           );
+      liveInboundTrucks++; // count it against the flood cap for the rest of this tick
     }
 
     // 2) Close: replenish Orders whose SKU is back above reorder (delivered), or

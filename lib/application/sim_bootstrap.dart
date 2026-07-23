@@ -72,10 +72,23 @@ void bootstrapSimUnits(
   final anyStock = config.cells.any(
       (c) => c.type.isRack && c.quantity > 0 && (c.skuId ?? '').isNotEmpty);
   if (!anyStock) {
-    config = config.copyWith(
-      cells: assignTemplateInventory(
-          config.cells, Random(ref.read(simSeedProvider))),
-    );
+    final seeded = assignTemplateInventory(
+        config.cells, Random(ref.read(simSeedProvider)));
+    // Start racks HEALTHY (above the 50% reorder line). assignTemplateInventory
+    // fills 30–70%, which leaves many racks under reorder — and StockMonitor then
+    // summons an inbound truck for every one of them on the same tick, flooding
+    // the bays and clogging the loop (EFF 0). Top the low ones up so ops open with
+    // sustainable stock; natural depletion drives replenishment gradually after.
+    config = config.copyWith(cells: [
+      for (final c in seeded)
+        if (c.type.isRack &&
+            (c.skuId ?? '').isNotEmpty &&
+            c.quantity > 0 &&
+            c.quantity < (c.maxQuantity * 0.6).floor())
+          c.copyWith(quantity: (c.maxQuantity * 0.85).round())
+        else
+          c,
+    ]);
     ref.read(warehouseConfigProvider.notifier).state = config;
   }
 
