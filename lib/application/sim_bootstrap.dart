@@ -79,6 +79,17 @@ void bootstrapSimUnits(
     ref.read(warehouseConfigProvider.notifier).state = config;
   }
 
+  // ── De-gridlock a packed spawn ───────────────────────────────────────────
+  // If robots are packed so tightly that most have NO free walkable neighbour to
+  // step into — stacked in a narrow inbound lane or a 1-wide strip, the user's
+  // "swarm" — they can never disperse and read as frozen even once work flows.
+  // Detect that and spread them across the floor's walkable cells so the loop can
+  // start. Conservative: a normally-spread layout (templates, sensible creator
+  // builds) has plenty of escape room and is left exactly as placed.
+  if (_isGridlockedSpawn(config, robots)) {
+    robots = _spreadRobots(config, robots);
+  }
+
   final positions = ref.read(manualRobotPositionsProvider.notifier);
 
   // Every robot gets a role so it does real work; roles round-robin so the whole
@@ -193,6 +204,52 @@ GridPos truckSpawnCell(WarehouseConfig cfg) {
     }
   }
   return (row: 0, col: 0);
+}
+
+bool _cellWalkable(WarehouseConfig cfg, int r, int c) {
+  if (r < 0 || r >= cfg.rows || c < 0 || c >= cfg.cols) return false;
+  final t = cfg.cellAt(r, c)?.type ?? CellType.empty;
+  return t.isWalkable || t == CellType.empty;
+}
+
+/// True when the spawn is so packed that most robots have NO free walkable
+/// neighbour (every adjacent walkable cell is another robot's spawn) — a swarm
+/// that cannot disperse. Only fires for genuine gridlock, so a normally-spread
+/// layout is never disturbed.
+bool _isGridlockedSpawn(WarehouseConfig cfg, List<SpawnedRobot> robots) {
+  if (robots.length < 4) return false;
+  final occupied = {for (final r in robots) '${r.row}_${r.col}'};
+  const dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+  var boxed = 0;
+  for (final r in robots) {
+    final hasEscape = dirs.any((d) {
+      final nr = r.row + d.$1, nc = r.col + d.$2;
+      return _cellWalkable(cfg, nr, nc) && !occupied.contains('${nr}_$nc');
+    });
+    if (!hasEscape) boxed++;
+  }
+  return boxed >= (robots.length * 0.6).ceil();
+}
+
+/// Re-place [robots] (keeping their ids) on evenly-spaced walkable cells across
+/// the floor so a gridlocked swarm can disperse. Deterministic (row-major scan +
+/// even stride). No-op if there aren't enough walkable cells to hold them all.
+List<SpawnedRobot> _spreadRobots(WarehouseConfig cfg, List<SpawnedRobot> robots) {
+  final cells = <GridPos>[];
+  for (var r = 0; r < cfg.rows; r++) {
+    for (var c = 0; c < cfg.cols; c++) {
+      if (_cellWalkable(cfg, r, c)) cells.add((row: r, col: c));
+    }
+  }
+  if (cells.length < robots.length) return robots;
+  return [
+    for (var i = 0; i < robots.length; i++)
+      (
+        id: robots[i].id,
+        row: cells[i * cells.length ~/ robots.length].row,
+        col: cells[i * cells.length ~/ robots.length].col,
+      ),
+  ];
 }
 
 /// The UOM a general-purpose picker should handle for [cfg]: the type of the

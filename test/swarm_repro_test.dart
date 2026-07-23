@@ -90,17 +90,16 @@ void main() {
     expect(r.moved, greaterThanOrEqualTo(4), reason: 'robots must do work');
   });
 
-  testWidgets('SWARM: robots packed in a 1-wide column disperse once work flows',
+  testWidgets('SWARM: a gridlocked 1-wide column de-gridlocks, spreads and works',
       (tester) async {
     final ref = await _ref(tester);
     final base = _template();
-    // A tight cluster on a walkable corridor (the mid cross-aisle spans the floor
-    // width). This is the realistic "swarm" — many robots bunched on navigable
-    // cells — as opposed to a pathological road-lane funnel.
-    final rMid = (base.rows - 1) ~/ 2;
+    // The user's screenshot: every robot stacked in the far-left column (col 0 is
+    // a road lane walled on the right by the non-walkable dock) — the pathological
+    // funnel where, unfixed, only 1 of 8 could ever escape.
     final packed = <RobotSpawn>[
       for (var i = 0; i < 8; i++)
-        RobotSpawn(row: rMid, col: 2 + i, robotType: 'AMR', name: 'BOT-$i'),
+        RobotSpawn(row: 1 + i, col: 0, robotType: 'AMR', name: 'BOT-$i'),
     ];
     final cfg = base.copyWith(
       robotSpawns: packed,
@@ -109,15 +108,16 @@ void main() {
     ref.read(warehouseConfigProvider.notifier).state = cfg;
 
     final r = _run(ref, cfg, 600);
-    // Where did they end up — still stacked in col 0, or spread across columns?
+    // Where did they end up — still stacked in col 0, or spread across the floor?
     final pos = ref.read(manualRobotPositionsProvider);
     final cols = {for (final id in packed.map((s) => s.name!)) pos[id]?.col};
-    debugPrint('SWARM    -> orders=${r.orders} moved=${r.moved}/8 endCols=$cols');
+    debugPrint('SWARM    -> orders=${r.orders} pickJobs=${r.pickJobs} '
+        'moved=${r.moved}/8 endCols=$cols');
     expect(r.orders, greaterThan(0), reason: 'work must flow');
-    expect(r.moved, greaterThanOrEqualTo(6),
-        reason: 'a packed column must NOT stay frozen — most robots disperse');
-    expect(cols.length, greaterThan(2),
-        reason: 'robots must spread across the floor, not stay in one column');
+    expect(r.pickJobs, greaterThan(0),
+        reason: 'pickers must actually claim + navigate, not just be relocated');
+    expect(cols.length, greaterThan(3),
+        reason: 'the swarm must break up across the floor, not stay in one column');
   });
 
   testWidgets('BUG: an UNSTOCKED warehouse must self-bootstrap and move robots',
