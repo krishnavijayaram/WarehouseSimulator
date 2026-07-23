@@ -33,6 +33,11 @@ class PickRobotBrain extends UnitBrain {
   static const int kPickTicks = 3;
   static const int kDropTicks = 2;
 
+  /// Give up a job whose drive can't finish within this many ticks so a picker
+  /// can never strand itself holding stock it cannot deliver (the "stuck carrying
+  /// SKU-x" wedge). Roomy so a legitimately long, congested haul is never cut.
+  static const int kGiveUpTicks = 350;
+
   _PK _state = _PK.idle;
   String? _jobId;
   String? _idemKey;
@@ -145,6 +150,7 @@ class PickRobotBrain extends UnitBrain {
         lifecycle = UnitLifecycle.idle;
 
       case _PK.toRack:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _PK.picking;
           _ticksLeft = kPickTicks;
@@ -195,6 +201,7 @@ class PickRobotBrain extends UnitBrain {
         }
 
       case _PK.toStage:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _PK.staging;
           _ticksLeft = kDropTicks;
@@ -231,7 +238,9 @@ class PickRobotBrain extends UnitBrain {
   }
 
   int _blockedTicks = 0;
+  int _driveTicks = 0; // ticks spent driving the current job (give-up guard)
   bool _advance(ActionApplier applier) {
+    _driveTicks++;
     if (_pathIdx < _path.length - 1) {
       if (applier.tryStep(this, _path[_pathIdx + 1])) {
         _pathIdx++;
@@ -317,6 +326,7 @@ class PickRobotBrain extends UnitBrain {
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
+    _driveTicks = 0;
   }
 
   /// An inbound replenishment for [sku] is open/fulfilling — stock is coming, so

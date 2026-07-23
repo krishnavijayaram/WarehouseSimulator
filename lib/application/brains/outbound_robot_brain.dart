@@ -22,6 +22,12 @@ class OutboundRobotBrain extends UnitBrain {
   static const int kPickTicks = 2;
   static const int kLoadTicks = 2;
 
+  /// Give up a job whose drive can't finish within this many ticks — a truck that
+  /// departed or an unreachable bay would otherwise strand the robot holding a
+  /// pallet forever (the "stuck carrying SKU-x" wedge). Roomy so a legitimately
+  /// long, congested haul is never cut short.
+  static const int kGiveUpTicks = 350;
+
   _OR _state = _OR.idle;
   String? _jobId;
   String _sku = '';
@@ -85,6 +91,7 @@ class OutboundRobotBrain extends UnitBrain {
         lifecycle = UnitLifecycle.idle;
 
       case _OR.toStage:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _OR.picking;
           _ticksLeft = kPickTicks;
@@ -118,6 +125,7 @@ class OutboundRobotBrain extends UnitBrain {
         }
 
       case _OR.toTruck:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _OR.loading;
           _ticksLeft = kLoadTicks;
@@ -137,7 +145,9 @@ class OutboundRobotBrain extends UnitBrain {
   }
 
   int _blockedTicks = 0;
+  int _driveTicks = 0; // ticks spent driving the current job (give-up guard)
   bool _advance(ActionApplier applier) {
+    _driveTicks++;
     if (_pathIdx < _path.length - 1) {
       if (applier.tryStep(this, _path[_pathIdx + 1])) {
         _pathIdx++;
@@ -197,6 +207,7 @@ class OutboundRobotBrain extends UnitBrain {
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
+    _driveTicks = 0;
   }
 
   List<GridPos> _findPath(WarehouseConfig cfg, GridPos from, GridPos to,

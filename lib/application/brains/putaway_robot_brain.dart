@@ -30,6 +30,10 @@ class PutawayRobotBrain extends UnitBrain {
   static const int kDropTicks = 2;
   static const double kReplenishThreshold = 0.5;
 
+  /// Give up a job whose drive can't finish within this many ticks so a cart can
+  /// never strand itself holding a pallet it cannot deliver.
+  static const int kGiveUpTicks = 350;
+
   _PR _state = _PR.idle;
   String? _jobId;
   String _sku = '';
@@ -205,6 +209,7 @@ class PutawayRobotBrain extends UnitBrain {
         lifecycle = UnitLifecycle.idle;
 
       case _PR.toStaging:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _PR.picking;
           _ticksLeft = kPickTicks;
@@ -234,6 +239,7 @@ class PutawayRobotBrain extends UnitBrain {
         }
 
       case _PR.toRack:
+        if (_driveTicks > kGiveUpTicks) return _abort(ctx);
         if (_advance(applier)) {
           _state = _PR.dropping;
           _ticksLeft = kDropTicks;
@@ -305,7 +311,9 @@ class PutawayRobotBrain extends UnitBrain {
 
   /// Advance one cell along the current path; returns true once at the end.
   int _blockedTicks = 0;
+  int _driveTicks = 0; // ticks spent driving the current job (give-up guard)
   bool _advance(ActionApplier applier) {
+    _driveTicks++;
     if (_pathIdx < _path.length - 1) {
       if (applier.tryStep(this, _path[_pathIdx + 1])) {
         _pathIdx++;
@@ -444,6 +452,7 @@ class PutawayRobotBrain extends UnitBrain {
     _path = const [];
     _pathIdx = 0;
     _ticksLeft = 0;
+    _driveTicks = 0;
   }
 
   // ── 5.1–5.4 destination rule (ported from PalletPutawayController) ──────────
