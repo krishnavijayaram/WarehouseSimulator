@@ -10,8 +10,11 @@
 /// "brains work in tests but not in the app" gap can't recur silently.
 library;
 
+import 'dart:math';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/warehouse_config.dart';
+import '../warehouse_engine/services/warehouse_template_factory.dart';
 import 'bay_resource.dart';
 import 'job_board.dart';
 import 'outbound_stage.dart';
@@ -55,6 +58,26 @@ void bootstrapSimUnits(
   ref.read(stageReservationProvider.notifier).clear();
   ref.read(cellReservationProvider.notifier).clear();
   ref.read(outboundStageProvider.notifier).clear();
+
+  // ── Self-bootstrap starter stock ─────────────────────────────────────────
+  // The whole material loop is demand-driven off STOCKED racks: the outbound
+  // generator only ships a SKU that sits in a servable rack, and StockMonitor
+  // only reorders a rack that ALREADY has a skuId. A warehouse whose racks were
+  // never seeded — a custom build, or a layout round-tripped through the backend
+  // without per-cell inventory — can therefore NEVER start: no orders, no trucks,
+  // no picks, so every robot idles and (packed at spawn) reads as a frozen swarm
+  // (see test/swarm_repro_test.dart). If nothing is stocked, seed deterministic
+  // starter inventory now — a no-op for an already-stocked warehouse, and local
+  // client state only (never a backend write, so it stays EX-safe).
+  final anyStock = config.cells.any(
+      (c) => c.type.isRack && c.quantity > 0 && (c.skuId ?? '').isNotEmpty);
+  if (!anyStock) {
+    config = config.copyWith(
+      cells: assignTemplateInventory(
+          config.cells, Random(ref.read(simSeedProvider))),
+    );
+    ref.read(warehouseConfigProvider.notifier).state = config;
+  }
 
   final positions = ref.read(manualRobotPositionsProvider.notifier);
 
