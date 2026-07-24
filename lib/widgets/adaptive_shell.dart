@@ -24,6 +24,7 @@ import '../screens/game_screen.dart';
 import '../screens/orders_screen.dart';
 import '../screens/warehouse_creator_screen.dart';
 import '../application/providers.dart';
+import '../application/job_board.dart';
 import '../widgets/robot_card.dart';
 import '../widgets/connection_banner.dart';
 import '../widgets/tutorial_overlay.dart';
@@ -735,43 +736,74 @@ class _TrucksTab extends StatelessWidget {
 
 // ── Orders Tab ────────────────────────────────────────────────────────────────
 
-class _OrdersTab extends StatelessWidget {
+class _OrdersTab extends ConsumerWidget {
   const _OrdersTab({required this.frame});
   final SimFrame frame;
 
+  static Widget _chip(String text, Color color) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: color.withAlpha(30),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: color.withAlpha(80)),
+        ),
+        child: Text(text, style: TextStyle(fontSize: 8, color: color)),
+      );
+
   @override
-  Widget build(BuildContext context) {
-    if (frame.orders.isEmpty) {
-      return const _EmptyTab('No orders in current wave');
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Prefer the backend wave frame; fall back to the LIVE local sim's JobBoard.
+    // The deployed sim is client-only (EX-safety: it writes nothing to the cloud),
+    // so the wave frame is always empty in prod — but the sim's own orders drive
+    // the robots and belong on screen, so show them from jobBoardProvider.
+    if (frame.orders.isNotEmpty) {
+      return ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: frame.orders.length,
+        itemBuilder: (_, i) {
+          final o = frame.orders[i];
+          final statusColor = switch (o.status) {
+            'DONE' => _green,
+            'IN_PROGRESS' => _yellow,
+            _ => _muted,
+          };
+          return _RowTile(
+            leading: Text(o.type.isNotEmpty ? o.type.substring(0, 1) : '?',
+                style: const TextStyle(color: _cyan, fontSize: 12)),
+            title: o.id.length > 12
+                ? '…${o.id.substring(o.id.length - 12)}'
+                : o.id,
+            subtitle: o.type,
+            trailing: _chip(o.status, statusColor),
+          );
+        },
+      );
+    }
+
+    // ── Live local simulation orders ──────────────────────────────────────────
+    final orders = ref.watch(jobBoardProvider).orders.values.toList()
+      ..sort((a, b) => b.id.compareTo(a.id)); // newest first
+    if (orders.isEmpty) {
+      return const _EmptyTab('No active orders yet — the sim generates demand as it runs');
     }
     return ListView.builder(
       padding: const EdgeInsets.all(8),
-      itemCount: frame.orders.length,
+      itemCount: orders.length,
       itemBuilder: (_, i) {
-        final o = frame.orders[i];
-        final statusColor = switch (o.status) {
-          'DONE' => _green,
-          'IN_PROGRESS' => _yellow,
-          _ => _muted,
+        final o = orders[i];
+        final isOut = o.kind == OrderKind.outboundShip;
+        final (label, color) = switch (o.status) {
+          OrderStatus.closed => ('SHIPPED', _green),
+          OrderStatus.aborted => ('ABORTED', _muted),
+          _ => ('IN PROGRESS', _yellow),
         };
         return _RowTile(
-          leading: Text(
-            o.type.isNotEmpty ? o.type.substring(0, 1) : '?',
-            style: const TextStyle(color: _cyan, fontSize: 12),
-          ),
-          title:
-              o.id.length > 12 ? '…${o.id.substring(o.id.length - 12)}' : o.id,
-          subtitle: o.type,
-          trailing: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: statusColor.withAlpha(30),
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: statusColor.withAlpha(80)),
-            ),
-            child: Text(o.status,
-                style: TextStyle(fontSize: 8, color: statusColor)),
-          ),
+          leading: Text(isOut ? 'S' : 'R',
+              style: const TextStyle(color: _cyan, fontSize: 12)),
+          title: o.id,
+          subtitle:
+              '${isOut ? "Outbound ship" : "Inbound replenish"}  ·  ${o.progressUnits}/${o.orderedUnits} units',
+          trailing: _chip(label, color),
         );
       },
     );
