@@ -244,6 +244,12 @@ final isSimOwnerProvider = Provider<bool>((ref) {
       auth.user.email.trim().toLowerCase() == kOwnerEmail;
 });
 
+/// The current OUTBOUND WAVE number for the live local sim (WMS wave picking). A
+/// wave is one truckload of orders released together; it increments when the
+/// previous wave has fully shipped. The backend frame's waveNumber is dead in
+/// prod, so the UI reads this for the client-only sim.
+final simWaveProvider = StateProvider<int>((_) => 0);
+
 /// Polls live robot positions every 3 s — OWNER SESSION ONLY.
 /// Rebuilds automatically when [warehouseConfigProvider] changes.
 final liveRobotsProvider =

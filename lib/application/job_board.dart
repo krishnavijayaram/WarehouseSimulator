@@ -134,12 +134,17 @@ class Order {
     required this.kind,
     required this.createdTick,
     required this.lines,
+    this.waveId = 0,
   }) : assert(lines.isNotEmpty, 'an Order must have at least one line');
 
   final String id;
   final OrderKind kind;
   final List<OrderLine> lines;
   final int createdTick;
+
+  /// The outbound WAVE this order was released in (WMS wave picking). 0 = not
+  /// part of a wave (e.g. inbound replenishment, which is depletion-driven).
+  final int waveId;
 
   OrderStatus status = OrderStatus.open;
 
@@ -375,12 +380,14 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
     required OrderKind kind,
     required int nowTick,
     required List<OrderLine> lines,
+    int waveId = 0,
   }) {
     final order = Order(
       id: _nextId('ORD'),
       kind: kind,
       createdTick: nowTick,
       lines: lines,
+      waveId: waveId,
     );
     state = state.copyWith(orders: {...state.orders, order.id: order});
     return order;

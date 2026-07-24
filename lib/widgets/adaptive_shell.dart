@@ -490,7 +490,7 @@ class _TickerStripState extends ConsumerState<_TickerStrip>
       'ALERTS: ${kpi.conflicts}',
       'EFF: $effPct%',
       'BOTS: $botCount',
-      'WAVE #${widget.frame.waveNumber}',
+      'WAVE #${widget.frame.waveNumber > 0 ? widget.frame.waveNumber : ref.watch(simWaveProvider)}',
       'STATUS: $status',
     ];
     final text = items.join('    ◈    ');
@@ -882,12 +882,27 @@ class _OrdersTab extends ConsumerWidget {
 
 // ── Waves Tab ─────────────────────────────────────────────────────────────────
 
-class _WavesTab extends StatelessWidget {
+class _WavesTab extends ConsumerWidget {
   const _WavesTab({required this.frame});
   final SimFrame frame;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final localWave = ref.watch(simWaveProvider);
+    final wave = frame.waveNumber > 0 ? frame.waveNumber : localWave;
+    // The orders released in the current local wave (WMS wave picking).
+    final List<Order> waveOrders = localWave > 0
+        ? ref
+            .watch(jobBoardProvider)
+            .orders
+            .values
+            .where((o) => o.waveId == localWave)
+            .toList()
+        : <Order>[];
+    final shipped =
+        waveOrders.where((o) => o.status == OrderStatus.closed).length;
+    final units = waveOrders.fold<int>(0, (s, o) => s + o.orderedUnits);
+    final picked = waveOrders.fold<int>(0, (s, o) => s + o.progressUnits);
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -897,19 +912,22 @@ class _WavesTab extends StatelessWidget {
             const Text('CURRENT WAVE',
                 style: TextStyle(fontSize: 8, color: _muted, letterSpacing: 2)),
             const SizedBox(height: 8),
-            Text('# ${frame.waveNumber}',
+            Text('# $wave',
                 style: const TextStyle(
                     fontSize: 48, color: _cyan, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             _StatusBadge(frame.simStatus),
             const SizedBox(height: 16),
-            Text('${frame.orders.length} orders in wave',
-                style: const TextStyle(fontSize: 12, color: _muted)),
-            const SizedBox(height: 4),
             Text(
-              '${frame.robots.where((r) => r.state == 'MOVING').length} robots active',
+              waveOrders.isNotEmpty
+                  ? '$shipped / ${waveOrders.length} orders shipped'
+                  : '${frame.orders.length} orders in wave',
               style: const TextStyle(fontSize: 12, color: _muted),
             ),
+            const SizedBox(height: 4),
+            if (waveOrders.isNotEmpty)
+              Text('$picked / $units units picked (pallet · case · loose)',
+                  style: const TextStyle(fontSize: 12, color: _muted)),
           ],
         ),
       ),

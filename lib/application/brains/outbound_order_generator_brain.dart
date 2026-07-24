@@ -18,6 +18,7 @@ library;
 
 import '../../models/warehouse_config.dart';
 import '../job_board.dart';
+import '../providers.dart';
 import '../sim_random.dart';
 import 'outbound_truck_brain.dart';
 import 'unit_brain.dart';
@@ -28,9 +29,6 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
     required this.truckSpawn,
     required this.rng,
     Set<UomKind>? servableUoms,
-    this.wipCap = 3,
-    this.emitEveryTicks = 40,
-    this.emitJitterTicks = 15,
     this.maxUnitsPerLine = 2,
   })  : servableUoms = servableUoms ?? const {UomKind.pallet},
         super(role: UnitRole.outboundGenerator, pos: const (row: -1, col: -1));
@@ -46,56 +44,91 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
   /// claimableFor hides from the failure watchdog → the Order pins open forever.
   final Set<UomKind> servableUoms;
 
-  /// Max simultaneously-open outbound Orders.
-  final int wipCap;
-
-  /// Demand arrives on a jittered interval rather than every tick.
-  final int emitEveryTicks;
-  final int emitJitterTicks;
-
   /// Max native units (pallets / cases / handfuls) per line.
   final int maxUnitsPerLine;
 
+  /// Safety cap on how many orders one wave may contain (a wave normally fills a
+  /// truck well before this).
+  static const int kMaxOrdersPerWave = 25;
+
   int _seq = 0;
-  int _nextEmitAtTick = 0;
+  int _wave = 0; // current outbound WAVE number (WMS wave picking)
+  Set<String> _waveOrderIds = const {}; // orders released in the current wave
 
   @override
   void perceiveAndDecide(BrainContext ctx) {
+    final orders = ctx.ref.read(jobBoardProvider).orders;
+
+    // WMS serial waves — ONE wave on the floor at a time. A wave is still running
+    // while any order it released is not yet terminal (shipped or aborted); only
+    // once the whole set has shipped do we release the next wave.
+    final waveRunning = _waveOrderIds.any((oid) {
+      final o = orders[oid];
+      return o != null &&
+          o.status != OrderStatus.closed &&
+          o.status != OrderStatus.aborted;
+    });
+    if (waveRunning) return;
+
+    // Nothing to ship until something is stocked in a servable rack.
+    if (_stockedByUom(ctx.config).isEmpty) return;
+
+    // ── Release the next wave: a truckload of random orders, each routed across
+    //    the UOMs it stocks (pallet / case / loose), all picked concurrently. ──
+    _wave++;
+    ctx.ref.read(simWaveProvider.notifier).state = _wave;
+    final released = <String>{};
+    final registry = ctx.ref.read(unitRegistryProvider.notifier);
+    OutboundTruckBrain? truck;
+    var waveUnits = 0;
+    // Fill to ~one truckload, with headroom so the wave rides on a single truck.
+    final target = (kOutboundTruckCapacityUnits * 0.75).round();
+    while (waveUnits < target && released.length < kMaxOrdersPerWave) {
+      final order = _mintOneOrder(ctx);
+      if (order == null) break; // transient shortage — stop the wave here
+      released.add(order.id);
+      waveUnits += order.orderedUnits;
+      // Pool onto the wave's truck; only open a fresh one if this order overflows
+      // (a big wave may span two trucks — the pooling handles it).
+      if (truck != null && truck.canAccept(ctx, order.orderedUnits)) {
+        truck.addOrder(ctx, order.id);
+      } else {
+        truck = OutboundTruckBrain(
+          id: 'OTRUCK-$id-${_seq++}',
+          pos: truckSpawn,
+          orderId: order.id,
+        );
+        registry.register(truck);
+      }
+    }
+
+    if (released.isEmpty) {
+      _wave--; // couldn't release anything this tick — retry the same wave number
+      ctx.ref.read(simWaveProvider.notifier).state = _wave;
+    } else {
+      _waveOrderIds = released;
+    }
+  }
+
+  /// Mint ONE random outbound Order (one line per UOM it stocks) plus its
+  /// pick-to-stage Jobs, tagged with the current wave. Null on a transient
+  /// shortage (nothing servable stocked right now).
+  Order? _mintOneOrder(BrainContext ctx) {
     final board = ctx.board;
-    final orders = ctx.ref.read(jobBoardProvider).orders.values;
-    final openOutbound = orders
-        .where((o) =>
-            o.kind == OrderKind.outboundShip &&
-            (o.status == OrderStatus.open ||
-                o.status == OrderStatus.fulfilling))
-        .length;
-    if (openOutbound >= wipCap) return;
-
-    // Demand arrives on a jittered interval — not every single tick.
-    if (ctx.tick < _nextEmitAtTick) return;
-
-    // Sample a SKU that is actually stocked in a SERVABLE rack type. Demand for a
-    // SKU nothing can supply would mint an unpickable Job and pin the Order open;
-    // the inbound loop is still driven, because shipping depletes these racks and
-    // the StockMonitor reorders them.
     final byUom = _stockedByUom(ctx.config);
-    if (byUom.isEmpty) return;
+    if (byUom.isEmpty) return null;
     final skus = byUom.keys.toList()..sort(); // deterministic candidate order
     final sku = rng.pick(skus);
     final available = byUom[sku]!.toList()
       ..sort((a, b) => a.index.compareTo(b.index));
-    if (available.isEmpty) return;
+    if (available.isEmpty) return null;
 
-    // Explode into ONE LINE PER UOM — this is "route as pallet, case, loose".
-    // Each line is claimed by the picker handling that UOM, so all three work the
-    // same order concurrently and it groups at the shipping area.
+    // Explode into ONE LINE PER UOM — "route as pallet, case, loose". Each line
+    // is claimed by the picker for that UOM, so all three routes work the order
+    // concurrently and it groups at the shipping area.
     final lines = <OrderLine>[];
     for (final uom in available) {
-      // Coin-flip EVERY UOM (including the first) so order shapes really vary —
-      // the old `lines.isNotEmpty &&` guard made the lowest-index UOM appear in
-      // every order and left the fallback below dead (review #6). If all flips
-      // miss, the fallback guarantees at least one line.
-      if (!rng.chance(0.6)) continue;
+      if (!rng.chance(0.6)) continue; // coin-flip every UOM so shapes vary
       final nativeUnits = rng.nextIntIn(1, maxUnitsPerLine);
       lines.add(OrderLine(
         lineId: 'L${lines.length}',
@@ -118,11 +151,10 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
       kind: OrderKind.outboundShip,
       nowTick: ctx.tick,
       lines: lines,
+      waveId: _wave,
     );
 
-    // One Job PER NATIVE UNIT: a robot carries one pallet/case/handful per trip,
-    // so a 3-pallet line is 3 Jobs. Minting one fat Job instead would let a single
-    // trip settle it after moving one unit, wedging the Order at 48/144 forever.
+    // One Job PER NATIVE UNIT (a robot carries one pallet/case/handful per trip).
     for (final line in lines) {
       final perTrip = line.uom.looseUnits;
       final trips = (line.units / perTrip).ceil();
@@ -139,31 +171,7 @@ class OutboundOrderGeneratorBrain extends UnitBrain {
         );
       }
     }
-
-    // POOL the truck: put this order on an existing truck that still has room,
-    // and only summon a new one when none can take it. One truck per order meant
-    // N trucks competing for a single bay — most never docked before their
-    // seek timeout and aborted their own order (~87% failure in the E2E probe).
-    final registry = ctx.ref.read(unitRegistryProvider.notifier);
-    final units = lines.fold<int>(0, (s, l) => s + l.units);
-    OutboundTruckBrain? host;
-    for (final u in registry.all()) {
-      if (u is OutboundTruckBrain && u.canAccept(ctx, units)) {
-        host = u;
-        break; // deterministic: registry.all() is id-sorted
-      }
-    }
-    if (host != null) {
-      host.addOrder(ctx, order.id);
-    } else {
-      registry.register(OutboundTruckBrain(
-        id: 'OTRUCK-$id-${_seq++}',
-        pos: truckSpawn,
-        orderId: order.id,
-      ));
-    }
-
-    _nextEmitAtTick = ctx.tick + rng.jitter(emitEveryTicks, emitJitterTicks);
+    return order;
   }
 
   /// SKU → the servable UOMs it currently has stock in.
