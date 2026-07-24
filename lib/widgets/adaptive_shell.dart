@@ -25,6 +25,8 @@ import '../screens/orders_screen.dart';
 import '../screens/warehouse_creator_screen.dart';
 import '../application/providers.dart';
 import '../application/job_board.dart';
+import '../application/brains/inbound_truck_brain.dart';
+import '../application/brains/outbound_truck_brain.dart';
 import '../widgets/robot_card.dart';
 import '../widgets/connection_banner.dart';
 import '../widgets/tutorial_overlay.dart';
@@ -708,30 +710,98 @@ class _FleetTab extends ConsumerWidget {
 
 // ── Trucks Tab ────────────────────────────────────────────────────────────────
 
-class _TrucksTab extends StatelessWidget {
+class _TrucksTab extends ConsumerWidget {
   const _TrucksTab({required this.trucks, required this.shipmentsByTruck});
   final List<Map<String, dynamic>> trucks;
   final Map<String, List<Map<String, dynamic>>> shipmentsByTruck;
 
   @override
-  Widget build(BuildContext context) {
-    if (trucks.isEmpty) {
-      return const _EmptyTab(
-          'No inbound trucks on road.\nDispatch an order to see trucks here.');
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Backend trucks first; fall back to the LIVE local sim's trucks. The deployed
+    // sim is client-only (writes nothing to the cloud, EX-safety), so the backend
+    // list is empty in prod — but its own inbound/outbound trucks are on the yard
+    // and belong on screen, so read them from the unit registry.
+    if (trucks.isNotEmpty) {
+      return ListView.builder(
+        padding: const EdgeInsets.all(8),
+        itemCount: trucks.length,
+        itemBuilder: (_, i) {
+          final t = trucks[i];
+          final tid = t['truck_id'] as String? ?? '';
+          return TruckFleetCard(
+            truck: t,
+            shipments: shipmentsByTruck[tid] ?? const [],
+          );
+        },
+      );
     }
-    return ListView.builder(
+
+    // ── Live local simulation trucks ──────────────────────────────────────────
+    final units = ref.watch(unitRegistryProvider).values;
+    final inbound = units.whereType<InboundTruckBrain>().toList();
+    final outbound = units.whereType<OutboundTruckBrain>().toList();
+    if (inbound.isEmpty && outbound.isEmpty) {
+      return const _EmptyTab(
+          'No trucks on the yard right now.\nInbound arrives as stock runs low; '
+          'outbound spawns per shipment.');
+    }
+    return ListView(
       padding: const EdgeInsets.all(8),
-      itemCount: trucks.length,
-      itemBuilder: (_, i) {
-        final t = trucks[i];
-        final tid = t['truck_id'] as String? ?? '';
-        return TruckFleetCard(
-          truck: t,
-          shipments: shipmentsByTruck[tid] ?? const [],
-        );
-      },
+      children: [
+        for (final t in inbound)
+          _TruckTile(
+            dir: 'IN',
+            id: t.id,
+            detail: '${t.manifest} pallet${t.manifest == 1 ? "" : "s"}'
+                '  ·  ${t.skuId}',
+            row: t.pos.row,
+            col: t.pos.col,
+            color: _green,
+          ),
+        for (final t in outbound)
+          _TruckTile(
+            dir: 'OUT',
+            id: t.id,
+            detail: '${t.orders.length} order${t.orders.length == 1 ? "" : "s"} '
+                'aboard',
+            row: t.pos.row,
+            col: t.pos.col,
+            color: _yellow,
+          ),
+      ],
     );
   }
+}
+
+class _TruckTile extends StatelessWidget {
+  const _TruckTile({
+    required this.dir,
+    required this.id,
+    required this.detail,
+    required this.row,
+    required this.col,
+    required this.color,
+  });
+  final String dir, id, detail;
+  final int row, col;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => _RowTile(
+        leading: Text(dir, style: TextStyle(color: color, fontSize: 10)),
+        title: id,
+        subtitle: '$detail  ·  at ($row,$col)',
+        trailing: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: color.withAlpha(30),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: color.withAlpha(80)),
+          ),
+          child: Text(dir == 'IN' ? 'INBOUND' : 'OUTBOUND',
+              style: TextStyle(fontSize: 8, color: color)),
+        ),
+      );
 }
 
 // ── Orders Tab ────────────────────────────────────────────────────────────────
