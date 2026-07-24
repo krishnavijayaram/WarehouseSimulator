@@ -620,7 +620,9 @@ class _DataTabs extends ConsumerWidget {
             .map((e) => Robot(
                   id: e.key,
                   name: e.key,
-                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  type: e.key.toLowerCase().contains('truck')
+                    ? 'TRUCK'
+                    : (e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR'),
                   x: e.value.col.toDouble(),
                   y: e.value.row.toDouble(),
                   state: 'MOVING',
@@ -3185,7 +3187,9 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
           .map((e) => Robot(
                 id: e.key,
                 name: e.key,
-                type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                type: e.key.toLowerCase().contains('truck')
+                    ? 'TRUCK'
+                    : (e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR'),
                 x: e.value.col.toDouble(),
                 y: e.value.row.toDouble(),
                 state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',
@@ -3226,7 +3230,9 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
             .map((e) => Robot(
                   id: e.key,
                   name: e.key,
-                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  type: e.key.toLowerCase().contains('truck')
+                    ? 'TRUCK'
+                    : (e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR'),
                   x: e.value.col.toDouble(),
                   y: e.value.row.toDouble(),
                   state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',

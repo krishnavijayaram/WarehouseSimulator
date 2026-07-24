@@ -488,7 +488,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
           .map((e) => Robot(
                 id: e.key,
                 name: e.key,
-                type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                type: e.key.toLowerCase().contains('truck')
+                    ? 'TRUCK'
+                    : (e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR'),
                 x: e.value.col.toDouble(),
                 y: e.value.row.toDouble(),
                 state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',
@@ -521,7 +523,9 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
             .map((e) => Robot(
                   id: e.key,
                   name: e.key,
-                  type: e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR',
+                  type: e.key.toLowerCase().contains('truck')
+                    ? 'TRUCK'
+                    : (e.key.toLowerCase().contains('agv') ? 'AGV' : 'AMR'),
                   x: e.value.col.toDouble(),
                   y: e.value.row.toDouble(),
                   state: selectedRobotId == e.key ? 'SELECTED' : 'IDLE',
@@ -3246,12 +3250,76 @@ class FloorPainter extends CustomPainter {
         );
       }
 
-      if (robot.type == 'AGV') {
+      if (robot.type == 'TRUCK') {
+        _drawTruck(canvas, center, radius, robot);
+      } else if (robot.type == 'AGV') {
         _drawAGV(canvas, center, radius, color, robot);
       } else {
         _drawAMR(canvas, center, radius, color, robot);
       }
     }
+  }
+
+  /// A distinct top-down truck (trailer + cab) so the sim's inbound/outbound
+  /// trucks read as TRUCKS on the floor, not as robots. Teal = inbound
+  /// (receiving), amber = outbound (shipping).
+  void _drawTruck(Canvas canvas, Offset c, double r, Robot robot) {
+    final outbound = robot.id.toUpperCase().startsWith('OTRUCK');
+    final body = outbound ? const Color(0xFFF59E0B) : const Color(0xFF14B8A6);
+    final trailerW = r * 2.7;
+    final trailerH = r * 1.6;
+    // Shadow
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+            center: c + const Offset(2, 2), width: trailerW, height: trailerH),
+        Radius.circular(r * 0.2),
+      ),
+      Paint()
+        ..color = Colors.black.withAlpha(90)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4),
+    );
+    // Trailer
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(center: c, width: trailerW, height: trailerH),
+        Radius.circular(r * 0.2),
+      ),
+      Paint()..color = body,
+    );
+    // Cab (front, on the right)
+    final cabW = r * 0.75;
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(
+            c.dx + trailerW / 2 - cabW, c.dy - trailerH / 2, cabW, trailerH),
+        Radius.circular(r * 0.2),
+      ),
+      Paint()..color = Color.lerp(body, Colors.black, 0.4)!,
+    );
+    // Outline
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(center: c, width: trailerW, height: trailerH),
+        Radius.circular(r * 0.2),
+      ),
+      Paint()
+        ..color = Colors.white.withAlpha(70)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+    // IN / OUT label
+    final tp = TextPainter(
+      text: TextSpan(
+        text: outbound ? 'OUT' : 'IN',
+        style: TextStyle(
+            color: Colors.white,
+            fontSize: r * 0.7,
+            fontWeight: FontWeight.bold),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, c - Offset(tp.width / 2 + r * 0.3, tp.height / 2));
   }
 
   /// Realistic AMR top-down view: rounded rect body, LIDAR sensor, 4 wheels,
