@@ -113,7 +113,9 @@ class InboundTruckBrain extends UnitBrain {
         } else if (!_hasOutstandingUnloads(ctx)) {
           // Manifest fully unloaded → free the bay and drive off.
           ctx.ref.read(bayOccupancyProvider.notifier).release(_bay!.row, _bay!.col);
-          final exit = _exit ?? (row: pos.row, col: 0);
+          // Leave up the LEFT road (col 0) and off the top — a truck departs the
+          // way it came, never across the floor.
+          final exit = _exit ?? (row: 0, col: 0);
           final approach =
               _adjacentDriveable(ctx.config, exit.row, exit.col) ?? exit;
           _path = _findPath(ctx.config, pos, approach);
@@ -169,13 +171,21 @@ class InboundTruckBrain extends UnitBrain {
     return raw.map((p) => (row: p.$2, col: p.$1)).toList();
   }
 
+  // A truck drives the ROAD network, its own bay column, and open yard floor —
+  // but NEVER the working storage interior: aisles, cross-aisles, robot paths,
+  // staging or pack cells are excluded. That confinement keeps a truck on the
+  // perimeter road and docked in the inbound column instead of cutting straight
+  // across the warehouse (the "truck crosses beyond the staging area" fault) and
+  // out of the aisles where it used to sit on cells the pick robots needed,
+  // jamming them into a line. `empty` stays driveable so a road-less yard (the
+  // acceptance layouts, a minimal custom build) can still route a truck to a bay.
   bool _driveable(WarehouseConfig cfg, int row, int col) {
     if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) return false;
     final t = cfg.cellAt(row, col)?.type ?? CellType.empty;
-    return t == CellType.empty ||
-        t.isRoad ||
-        t.isWalkable ||
-        t == CellType.inbound;
+    return t.isRoad ||
+        t == CellType.dock ||
+        t == CellType.inbound ||
+        t == CellType.empty;
   }
 
   GridPos? _adjacentDriveable(WarehouseConfig cfg, int row, int col) {

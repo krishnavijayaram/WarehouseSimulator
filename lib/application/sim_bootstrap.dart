@@ -181,7 +181,10 @@ void bootstrapSimUnits(
   }
 
   // The AoE "players" that issue work — they don't move, they trigger the loop.
-  final spawn = truckSpawnCell(config);
+  // Inbound trucks enter on the LEFT road, outbound on the RIGHT road, so each
+  // side's carriers stay on their own road+bay column and never cross the floor.
+  final inSpawn = truckSpawnCell(config);
+  final outSpawn = outboundTruckSpawnCell(config);
   // Demand may only ask for a UOM that BOTH a picker handles and a rack type can
   // supply. Anything else mints a Job nobody can claim, which claimableFor hides
   // from the failure watchdog → the Order pins open → the WIP cap stalls the
@@ -192,24 +195,46 @@ void bootstrapSimUnits(
   // consumer never shifts another's draws and a replay stays byte-identical.
   final rng = SimRng(ref.read(simSeedProvider));
 
-  registry.register(StockMonitorBrain(id: 'stock-monitor', truckSpawn: spawn));
+  registry.register(StockMonitorBrain(id: 'stock-monitor', truckSpawn: inSpawn));
   // Anomaly loop: the monitor SEES a manually-placed blocker and raises a clear
   // Job; the recovery unit hauls it to the dump yard. Perception and action stay
   // separate units coordinating only through the JobBoard.
   registry.register(BlockerMonitorBrain(id: 'blocker-monitor'));
   registry.register(OutboundOrderGeneratorBrain(
     id: 'order-gen',
-    truckSpawn: spawn,
+    truckSpawn: outSpawn,
     rng: rng.derive('order-gen'),
     servableUoms: servable,
   ));
 }
 
-/// A driveable yard cell for trucks to appear at: a road cell if any, else the
-/// first empty/walkable cell, else (0,0).
-GridPos truckSpawnCell(WarehouseConfig cfg) {
+/// Where INBOUND trucks appear: the top of the LEFT road lane (min road col,
+/// topmost cell) so they enter from the top and queue down toward the bays.
+GridPos truckSpawnCell(WarehouseConfig cfg) => _roadSpawn(cfg, rightSide: false);
+
+/// Where OUTBOUND trucks appear: the top of the RIGHT road lane, mirroring the
+/// inbound side, so outbound carriers never spawn on the inbound road and cross
+/// the whole floor to reach a bay.
+GridPos outboundTruckSpawnCell(WarehouseConfig cfg) =>
+    _roadSpawn(cfg, rightSide: true);
+
+/// The topmost road cell of the left-most (or right-most) road lane. Falls back
+/// to the first empty/walkable cell, then the origin, if a layout has no road.
+GridPos _roadSpawn(WarehouseConfig cfg, {required bool rightSide}) {
+  int? laneCol;
   for (final c in cfg.cells) {
-    if (c.type.isRoad) return (row: c.row, col: c.col);
+    if (!c.type.isRoad) continue;
+    laneCol = laneCol == null
+        ? c.col
+        : (rightSide ? max(laneCol, c.col) : min(laneCol, c.col));
+  }
+  if (laneCol != null) {
+    GridPos? best;
+    for (final c in cfg.cells) {
+      if (!c.type.isRoad || c.col != laneCol) continue;
+      if (best == null || c.row < best.row) best = (row: c.row, col: c.col);
+    }
+    if (best != null) return best;
   }
   for (final c in cfg.cells) {
     if (c.type == CellType.empty || c.type.isWalkable) {

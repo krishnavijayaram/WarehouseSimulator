@@ -185,15 +185,19 @@ class RecoveryRobotBrain extends UnitBrain {
       }
       _blockedTicks++;
       _stuckTicks++;
-      if (_blockedTicks >= 4) {
-        final replan = _findPath(applier.config, pos, _path.last,
-            occupiedByOthers(applier.ref, id));
-        if (replan.length > 1) {
-          _path = replan;
-          _pathIdx = 0;
-        }
-        _blockedTicks = 0;
+      final reroute = recoverBlocked(
+        applier: applier,
+        blockedTicks: _blockedTicks,
+        goal: _path.last,
+        findPath: (f, t, occ, pen) => _findPath(applier.config, f, t, occ, pen),
+        sideStep: (occ) =>
+            _adjacentWalkable(applier.config, pos.row, pos.col, occ),
+      );
+      if (reroute != null) {
+        _path = reroute;
+        _pathIdx = 0;
       }
+      if (_blockedTicks >= UnitBrain.kDetourAt) _blockedTicks = 0;
       return false;
     }
     return true;
@@ -298,12 +302,13 @@ class RecoveryRobotBrain extends UnitBrain {
   }
 
   List<GridPos> _findPath(WarehouseConfig cfg, GridPos from, GridPos to,
-      [Set<(int, int)>? occupied]) {
+      [Set<(int, int)>? occupied, int? penalty]) {
     final pf = AStarPathfinder(cols: cfg.cols, rows: cfg.rows);
     final raw = pf.findPath(
       (from.col, from.row),
       (to.col, to.row),
       occupied: occupied,
+      penalty: penalty, // escalated when a robot is genuinely wedged
       walkable: (c) => _walkable(cfg, c.$2, c.$1),
     );
     return raw.map((p) => (row: p.$2, col: p.$1)).toList();

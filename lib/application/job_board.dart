@@ -319,6 +319,8 @@ class JobBoardState {
     required this.orders,
     required this.jobs,
     required this.consumedIdemKeys,
+    this.shippedCount = 0,
+    this.abortedCount = 0,
   });
 
   final Map<String, Order> orders;
@@ -327,15 +329,26 @@ class JobBoardState {
   /// Idem ledger (v2 Amendment C / LCC-4): idemKeys whose rack effect is applied.
   final Set<String> consumedIdemKeys;
 
+  /// Lifetime tallies (monotonic ↑). Terminal Orders are swept from [orders] so
+  /// they can't be counted after the fact — these persist the outcome: an
+  /// outbound Order that reached `closed` (fully loaded → shipped) and any Order
+  /// that `aborted`. Drives the "N shipped" KPI the WAVES/ORDERS tabs show.
+  final int shippedCount;
+  final int abortedCount;
+
   JobBoardState copyWith({
     Map<String, Order>? orders,
     Map<String, Job>? jobs,
     Set<String>? consumedIdemKeys,
+    int? shippedCount,
+    int? abortedCount,
   }) =>
       JobBoardState(
         orders: orders ?? this.orders,
         jobs: jobs ?? this.jobs,
         consumedIdemKeys: consumedIdemKeys ?? this.consumedIdemKeys,
+        shippedCount: shippedCount ?? this.shippedCount,
+        abortedCount: abortedCount ?? this.abortedCount,
       );
 
   static const empty =
@@ -580,10 +593,31 @@ class JobBoardNotifier extends StateNotifier<JobBoardState> {
           if (!sweptOrderIds.any((oid) => k.startsWith('$oid:'))) k
       };
     }
+    // Persist each swept Order's outcome before it vanishes: an outbound ship
+    // that closed = a real shipment; anything aborted = a failed order.
+    var shipped = state.shippedCount;
+    var aborted = state.abortedCount;
+    for (final id in sweptOrderIds) {
+      final o = state.orders[id];
+      if (o == null) continue;
+      if (o.status == OrderStatus.aborted) {
+        aborted++;
+      } else if (o.kind == OrderKind.outboundShip) {
+        shipped++;
+      }
+    }
     if (jobs.length != state.jobs.length ||
         orders.length != state.orders.length ||
-        idem.length != state.consumedIdemKeys.length) {
-      state = state.copyWith(jobs: jobs, orders: orders, consumedIdemKeys: idem);
+        idem.length != state.consumedIdemKeys.length ||
+        shipped != state.shippedCount ||
+        aborted != state.abortedCount) {
+      state = state.copyWith(
+        jobs: jobs,
+        orders: orders,
+        consumedIdemKeys: idem,
+        shippedCount: shipped,
+        abortedCount: aborted,
+      );
     }
   }
 

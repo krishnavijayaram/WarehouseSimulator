@@ -321,31 +321,19 @@ class PutawayRobotBrain extends UnitBrain {
         return false;
       }
       _blockedTicks++;
-      final goal = _path.last;
-      if (_blockedTicks == 4) {
-        final replan =
-            _findPath(applier.config, pos, goal, occupiedByOthers(applier.ref, id));
-        if (replan.length > 1) {
-          _path = replan;
-          _pathIdx = 0;
-        }
-      } else if (_blockedTicks >= 8) {
-        // Head-on: back out to a free side cell IF the goal stays reachable from
-        // there, so the opposing unit can pass (P6 back-out). A per-tick head-on
-        // yield was tried (deterministic id tie-break) but made robots hold cells
-        // longer, slowing blocker recovery below the e2e budget — reverted; the
-        // ghost-truck despawn fix removes the visible "stuck" robots on its own.
-        final side = _adjacentWalkable(
-            applier.config, pos.row, pos.col, occupiedByOthers(applier.ref, id));
-        if (side != null &&
-            _findPath(applier.config, side, goal).length > 1 &&
-            applier.tryStep(this, side)) {
-          _path =
-              _findPath(applier.config, pos, goal, occupiedByOthers(applier.ref, id));
-          _pathIdx = 0;
-        }
-        _blockedTicks = 0;
+      final reroute = recoverBlocked(
+        applier: applier,
+        blockedTicks: _blockedTicks,
+        goal: _path.last,
+        findPath: (f, t, occ, pen) => _findPath(applier.config, f, t, occ, pen),
+        sideStep: (occ) =>
+            _adjacentWalkable(applier.config, pos.row, pos.col, occ),
+      );
+      if (reroute != null) {
+        _path = reroute;
+        _pathIdx = 0;
       }
+      if (_blockedTicks >= UnitBrain.kDetourAt) _blockedTicks = 0;
       return false;
     }
     return true;
@@ -515,13 +503,14 @@ class PutawayRobotBrain extends UnitBrain {
   // ── Navigation helpers ─────────────────────────────────────────────────────
 
   List<GridPos> _findPath(WarehouseConfig cfg, GridPos from, GridPos to,
-      [Set<(int, int)>? occupied]) {
+      [Set<(int, int)>? occupied, int? penalty]) {
     final pf = AStarPathfinder(cols: cfg.cols, rows: cfg.rows);
     // Pathfinder tuples are (col, row); walkable predicate receives (col, row).
     final raw = pf.findPath(
       (from.col, from.row),
       (to.col, to.row),
       occupied: occupied, // soft congestion penalty (P6)
+      penalty: penalty, // escalated when a robot is genuinely wedged
       walkable: (c) => _walkable(cfg, c.$2, c.$1),
     );
     return raw.map((p) => (row: p.$2, col: p.$1)).toList();

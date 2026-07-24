@@ -102,9 +102,14 @@ class AStarPathfinder {
     (int, int) goal, {
     Set<(int, int)>? occupied,
     bool Function((int, int))? walkable,
+    int? penalty,
   }) {
     if (start == goal) return [start];
     final bool Function((int, int)) isWalkable = walkable ?? (_) => true;
+    // Per-call cost of stepping through a cell another robot holds. Small by
+    // default (prefer waiting a tick for a transient blocker); a caller passes a
+    // large value to force a long way-round when a robot is genuinely wedged.
+    final int stepPenalty = penalty ?? kRobotStepPenalty;
 
     final gScore = <(int, int), double>{start: 0};
     final fScore = <(int, int), double>{
@@ -128,7 +133,7 @@ class AStarPathfinder {
         if (!isWalkable(nb) && nb != goal) continue;
 
         final extra =
-            (occupied != null && occupied.contains(nb)) ? kRobotStepPenalty : 0;
+            (occupied != null && occupied.contains(nb)) ? stepPenalty : 0;
         final tentative = gScore[current]! + 1 + extra;
 
         if (tentative < (gScore[nb] ?? double.infinity)) {

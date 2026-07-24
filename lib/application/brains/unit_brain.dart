@@ -255,6 +255,64 @@ abstract class UnitBrain {
   /// their private FSM when forced idle (on going offline). Default: no-op.
   void onReset(BrainContext ctx) {}
 
+  // ── Shared head-of-line recovery (used by every driving robot brain) ─────────
+  // Robots move one cell/tick via ActionApplier.tryStep. When the next cell is
+  // held by another unit this tick tryStep fails; the brain counts consecutive
+  // blocked ticks and calls [recoverBlocked] to react. Kept in ONE place so all
+  // robots behave identically (the per-brain copies had already drifted).
+  //
+  // Escalation, cheapest first (thresholds measured on the seeded sweep — an
+  // earlier yield clears head-of-line jams AND ships more than the old 4/8, while
+  // a forced long cross-aisle detour was tried and measured WORSE on both: it
+  // burns the give-up budget on a wasteful trek, so it was dropped):
+  //   • [kSoftReplanAt] — congestion-aware replan; takes a genuinely different
+  //     route only when a SHORT one exists (a nearby cross-aisle), else holds.
+  //   • [kDetourAt]     — re-check that replan (adopt it only if its FIRST step is
+  //     free right now), and if the robot is still nose-to-nose, YIELD: step to a
+  //     free side cell so the opposing unit can pass, then re-plan from there. In
+  //     a 1-wide aisle the only free neighbour is backward, which still clears the
+  //     lane for the other robot.
+  // If nothing frees the robot, its per-brain give-up eventually aborts the job
+  // and re-attempts, so a robot can never be permanently wedged.
+  static const int kSoftReplanAt = 3;
+  static const int kDetourAt = 6;
+
+  /// One tick of blocked-recovery. Returns a new path (from the current [pos] to
+  /// [goal]) to adopt, or null to hold. [findPath]/[sideStep] are the calling
+  /// brain's own domain-typed helpers (each robot has a different walkable set).
+  /// May physically step the unit aside (via [applier]) as a last resort.
+  List<GridPos>? recoverBlocked({
+    required ActionApplier applier,
+    required int blockedTicks,
+    required GridPos goal,
+    required List<GridPos> Function(
+            GridPos from, GridPos to, Set<(int, int)>? occ, int? penalty)
+        findPath,
+    required GridPos? Function(Set<(int, int)>? occ) sideStep,
+  }) {
+    final occ = occupiedByOthers(applier.ref, id);
+    if (blockedTicks == kSoftReplanAt) {
+      final replan = findPath(pos, goal, occ, null);
+      if (replan.length > 1) return replan;
+    } else if (blockedTicks >= kDetourAt) {
+      // Re-check the congestion-aware replan; adopt only if its first step is
+      // free right now (the blocker may have moved / another route opened).
+      final replan = findPath(pos, goal, occ, null);
+      if (replan.length > 1 &&
+          !occ.contains((replan[1].col, replan[1].row))) {
+        return replan;
+      }
+      // Still nose-to-nose — yield: step to a free side cell so it can pass.
+      final side = sideStep(occ);
+      if (side != null &&
+          findPath(side, goal, null, null).length > 1 &&
+          applier.tryStep(this, side)) {
+        return findPath(pos, goal, occ, null);
+      }
+    }
+    return null;
+  }
+
   // ── Idle patrol — keep the floor alive (the sim must always SIMULATE) ────────
   // A robot that claimed no Job this tick must NOT freeze: it takes one
   // scout-style step toward the nearest unrevealed cell (revealing fog), so a

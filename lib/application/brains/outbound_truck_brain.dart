@@ -162,7 +162,9 @@ class OutboundTruckBrain extends UnitBrain {
           ctx.ref
               .read(bayOccupancyProvider.notifier)
               .release(_bay!.row, _bay!.col);
-          final exit = _exit ?? (row: pos.row, col: 0);
+          // Leave up the RIGHT road (col C-1) and off the top — the outbound
+          // side, never back across the floor to the inbound road.
+          final exit = _exit ?? (row: 0, col: ctx.config.cols - 1);
           final approach =
               _adjacentDriveable(ctx.config, exit.row, exit.col) ?? exit;
           _path = _findPath(ctx.config, pos, approach);
@@ -206,10 +208,18 @@ class OutboundTruckBrain extends UnitBrain {
     return raw.map((p) => (row: p.$2, col: p.$1)).toList();
   }
 
+  // Outbound trucks drive the road, the outbound bay column, and open yard floor
+  // — never the storage interior (mirror of the inbound truck), so a truck never
+  // crosses the floor to reach a bay, only ever waits on the road / in the bay
+  // column, and never parks on an aisle cell a pick/load robot needs. `empty`
+  // stays driveable so a road-less yard can still route a truck to a bay.
   bool _driveable(WarehouseConfig cfg, int row, int col) {
     if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) return false;
     final t = cfg.cellAt(row, col)?.type ?? CellType.empty;
-    return t == CellType.empty || t.isRoad || t.isWalkable;
+    return t.isRoad ||
+        t == CellType.dock ||
+        t == CellType.outbound ||
+        t == CellType.empty;
   }
 
   GridPos? _adjacentDriveable(WarehouseConfig cfg, int row, int col) {
