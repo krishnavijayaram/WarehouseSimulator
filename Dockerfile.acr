@@ -15,11 +15,13 @@ WORKDIR /app
 COPY . .
 ARG GATEWAY_URL
 ARG SIM_WS_URL
+ARG BUILD_ID=dev
 RUN flutter pub get \
  && flutter build web --release \
       --dart-define=ENV=prod \
       --dart-define=GATEWAY_URL=${GATEWAY_URL} \
-      --dart-define=SIM_WS_URL=${SIM_WS_URL}
+      --dart-define=SIM_WS_URL=${SIM_WS_URL} \
+      --dart-define=BUILD_ID=${BUILD_ID}
 
 # ── Stage 2: serve with nginx ───────────────────────────────────────────────
 FROM nginx:1.27-alpine

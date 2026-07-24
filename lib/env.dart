@@ -15,6 +15,12 @@ const _simWsUrl = String.fromEnvironment('SIM_WS_URL', defaultValue: '');
 const _gatewayApiKey =
     String.fromEnvironment('GATEWAY_API_KEY', defaultValue: '');
 
+/// Short build id (the git SHA), injected at build time via
+/// `--dart-define=BUILD_ID=<sha>`. Shown in the scouting badge so a live screen
+/// can be matched to an exact deploy — instantly telling a real bug apart from a
+/// stale service-worker cache serving old JS.
+const buildId = String.fromEnvironment('BUILD_ID', defaultValue: 'dev');
+
 /// Base URL of the WIOS API gateway.
 ///   dev:  http://10.0.2.2:8004  (emulator) / http://localhost:8004 (web/desktop)
 ///   prod: set via --dart-define=GATEWAY_URL=https://...

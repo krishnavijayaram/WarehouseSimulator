@@ -227,15 +227,21 @@ Robot _mapApiRobot(Map<String, dynamic> r, WarehouseConfig config) {
   );
 }
 
-/// True only for the single account allowed to run the LIVE simulator + generate
-/// backend traffic; every other visitor gets a frozen static view. This is the
-/// EX-safety scope gate (one active session can't load the shared Postgres). It
-/// MUST be checked by every polling provider / write path — the earlier version
-/// lived only in floor_screen, so app-wide providers (live robots, inbound
-/// trucks, WMS dashboard, orders) bypassed it and polled for ALL users.
+/// The single owner account allowed to START and RUN the live simulator. Everyone
+/// else — logged in or not — gets a read-only view: they can watch the warehouse
+/// but cannot start operations or drive backend traffic. This is also the EX-safety
+/// scope gate (one active session can't load the shared Postgres). It MUST be
+/// checked by every polling provider / write path / Start-Operations button.
+///
+/// Gated on the owner's EMAIL so ownership is unambiguously one person (per the
+/// explicit request "only me — krishnavijayaram@gmail.com — can start"), rather
+/// than a backend `is_privileged` flag that could be set on more than one account.
+const kOwnerEmail = 'krishnavijayaram@gmail.com';
+
 final isSimOwnerProvider = Provider<bool>((ref) {
   final auth = ref.watch(authProvider);
-  return auth is AuthLoggedIn && auth.user.isPrivileged;
+  return auth is AuthLoggedIn &&
+      auth.user.email.trim().toLowerCase() == kOwnerEmail;
 });
 
 /// Polls live robot positions every 3 s — OWNER SESSION ONLY.

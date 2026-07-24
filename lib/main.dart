@@ -189,12 +189,16 @@ class _WoisAppState extends ConsumerState<WoisApp> {
         // to identity rather than to any screen — so no UI path can leak writes
         // and none has to remember to gate itself. Auth/session writes bypass the
         // guard by path, so login works for everyone regardless.
-        ApiClient.writesEnabled = next.user.isPrivileged;
-        manualControllerWritesEnabled = next.user.isPrivileged;
+        // Ownership is the owner EMAIL (kOwnerEmail), not a backend is_privileged
+        // flag that might be set on more than one account — per the "only me can
+        // start" requirement. All write/start/socket gates key off this.
+        final isOwner = next.user.email.trim().toLowerCase() == kOwnerEmail;
+        ApiClient.writesEnabled = isOwner;
+        manualControllerWritesEnabled = isOwner;
         // Start the frame WebSocket for the OWNER session only. Non-owners see a
         // static view, so a socket (and its reconnect churn against the Azure
         // gateway) buys them nothing.
-        if (next.user.isPrivileged) {
+        if (isOwner) {
           ref.read(simFrameProvider.notifier).connect();
         }
         _router.go('/dashboard');

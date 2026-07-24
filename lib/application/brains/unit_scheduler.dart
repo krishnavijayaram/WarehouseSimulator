@@ -98,6 +98,37 @@ class UnitScheduler {
 
     // Phase 3 — sweep terminal work.
     ref.read(jobBoardProvider.notifier).sweepTerminal();
+
+    // Phase 3b — global cargo-hold safety net. The per-brain give-up only counts
+    // ticks spent DRIVING, so a robot wedged in some other way while holding a
+    // pallet (a rare stall the drive counter never sees) could carry it forever —
+    // the "stuck carrying SKU-x, nothing ships" symptom. Any unit that has held
+    // cargo longer than a full-warehouse traversal could ever need is force-dropped
+    // here: cargo cleared, brain reset, Job released for re-attempt. A pallet can
+    // never be permanently stranded on a robot, in ANY state.
+    _enforceCargoHoldCap(ctx);
+  }
+
+  /// Ticks of continuous cargo-holding after which a unit is presumed wedged and
+  /// force-reset. Well above the per-brain drive give-up (350) so it only ever
+  /// catches genuine stalls, never a legitimately-long haul.
+  static const int kCargoHoldCap = 500;
+
+  void _enforceCargoHoldCap(BrainContext ctx) {
+    final cargo = ctx.ref.read(robotCargoProvider);
+    for (final u in ctx.ref.read(unitRegistryProvider.notifier).all()) {
+      if (!cargo.containsKey(u.id)) {
+        u.cargoHeldTicks = 0;
+        continue;
+      }
+      if (++u.cargoHeldTicks <= kCargoHoldCap) continue;
+      final jid = u.currentJobId;
+      ctx.ref.read(robotCargoProvider.notifier).clearCargo(u.id);
+      u.onReset(ctx); // release the brain's held reservations + reset its FSM
+      if (jid != null) ctx.board.releaseOrFail(jid); // fail → backpressure, re-attempt
+      u.cargoHeldTicks = 0;
+      u.lifecycle = UnitLifecycle.idle;
+    }
   }
 
   void _reclaimDeadOrderStage() {

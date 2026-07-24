@@ -7,6 +7,8 @@
 // flowing the late windows have orders too; if the loop wedges, generation
 // stops and robots pile up holding cargo they can never drop.
 
+import 'dart:math';
+
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,13 +24,16 @@ import 'package:warehouse_simulator/application/brains/inbound_truck_brain.dart'
 import 'package:warehouse_simulator/application/brains/outbound_truck_brain.dart';
 import 'package:warehouse_simulator/warehouse_engine/services/warehouse_template_factory.dart';
 
-WarehouseConfig _seeded(String name) {
+WarehouseConfig _seeded(String name, int seed) {
   final base = kWarehouseTemplates.firstWhere((t) => t.name == name).builder();
-  return base.copyWith(cells: assignTemplateInventory(base.cells));
+  // Deterministic inventory: without a seeded Random the stock distribution — and
+  // therefore whether any robot wedges — changes every run, making the test flaky.
+  return base.copyWith(cells: assignTemplateInventory(base.cells, Random(seed)));
 }
 
-Future<void> _runAndCheck(WidgetTester tester, String templateName) async {
-  final cfg = _seeded(templateName);
+Future<void> _runAndCheck(
+    WidgetTester tester, String templateName, int seed) async {
+  final cfg = _seeded(templateName, seed);
   late WidgetRef ref;
   await tester.pumpWidget(ProviderScope(
     child: Consumer(builder: (_, r, __) {
@@ -126,16 +131,22 @@ Future<void> _runAndCheck(WidgetTester tester, String templateName) async {
       reason: '$templateName: inbound trucks must not pile up on the bays');
   // No robot may hold the SAME cargo for the whole run — that is the "stuck
   // carrying SKU-x, all frozen" symptom.
-  expect(maxCargoHeld, lessThan(1500),
+  // The global cargo-hold safety net force-drops at kCargoHoldCap=500, so no hold
+  // should exceed that by more than a little abort slack. A value near the horizon
+  // means a pallet is stranded forever — the "stuck carrying SKU-x" symptom.
+  expect(maxCargoHeld, lessThan(700),
       reason:
-          '$templateName: a robot must not be stuck holding cargo it can never '
-          'drop (the stuck "carrying SKU-x" robots in the screenshot)');
+          '$templateName(seed=$seed): a robot must not be stuck holding cargo it '
+          'can never drop (the stuck "carrying SKU-x" robots in the screenshot)');
 }
 
 void main() {
-  testWidgets('STALL medium: demand keeps flowing, no cargo-stuck robots',
-      (t) => _runAndCheck(t, 'Medium Distribution Center B'));
-
-  testWidgets('STALL large: demand keeps flowing, no cargo-stuck robots',
-      (t) => _runAndCheck(t, 'Large Fulfilment Center B'));
+  // Sweep several deterministic stock distributions per size — different seeds
+  // wedge different robots, so one fixed seed can hide the bug.
+  for (final seed in [1, 2, 3, 4, 5]) {
+    testWidgets('STALL medium seed=$seed: demand flows, no cargo-stuck robot',
+        (t) => _runAndCheck(t, 'Medium Distribution Center B', seed));
+    testWidgets('STALL large seed=$seed: demand flows, no cargo-stuck robot',
+        (t) => _runAndCheck(t, 'Large Fulfilment Center B', seed));
+  }
 }

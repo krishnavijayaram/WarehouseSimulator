@@ -17,6 +17,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../core/api_client.dart';
 import '../core/auth/auth_provider.dart';
+import '../env.dart';
 import '../application/event_bus.dart';
 import '../application/manual_robot_controller.dart';
 import '../application/inbound_ops_controller.dart';
@@ -340,10 +341,7 @@ class _FloorScreenState extends ConsumerState<FloorScreen>
   /// NOTE: a client-side gate is not a security boundary (the enforced guarantee
   /// is still the Postgres role CONNECTION LIMIT); it is what makes the app quiet
   /// for everyone else.
-  bool get _isSimOwner {
-    final auth = ref.read(authProvider);
-    return auth is AuthLoggedIn && auth.user.isPrivileged;
-  }
+  bool get _isSimOwner => ref.read(isSimOwnerProvider);
 
   /// Actually starts bots and the scout simulation. Separated so it can be
   /// called both from Start Operations (EDITOR path) and from a heartbeat
@@ -2141,7 +2139,8 @@ class _ScoutProgressBadgeState extends State<ScoutProgressBadge> {
               const Icon(Icons.radar, color: Color(0xFF00D4FF), size: 13),
               const SizedBox(width: 5),
               Text(
-                'SCOUTING  $pct%  (${widget.explored}/${widget.total} cells)',
+                'SCOUTING  $pct%  (${widget.explored}/${widget.total} cells)'
+                '   ·   build $buildId',
                 style: const TextStyle(
                     color: Color(0xFF00D4FF),
                     fontSize: 10,

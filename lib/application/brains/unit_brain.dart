@@ -109,6 +109,12 @@ abstract class UnitBrain {
   /// The single Job slot that cycles null → Job → null (the unit is immortal).
   String? currentJobId;
 
+  /// Consecutive ticks this unit has been carrying cargo. The scheduler's global
+  /// cargo-hold safety net uses it to force-drop a pallet from a robot wedged in
+  /// ANY state (not just a drive, which the per-brain give-up covers), so a pallet
+  /// can never be stranded on a robot forever. Reset the moment cargo clears.
+  int cargoHeldTicks = 0;
+
   bool get isIdle => currentJobId == null && lifecycle == UnitLifecycle.idle;
 
   /// Phase 1 — sense the world, (maybe) claim a Job, and register an intended

@@ -3571,6 +3571,7 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
 
   // ── Start-ops overlay shown before the user starts operations ─────────────
   Widget _buildStartOpsOverlay(WarehouseConfig config) {
+    final isOwner = ref.watch(isSimOwnerProvider);
     return Positioned.fill(
       child: Container(
         color: const Color(0xFF0A0F14),
@@ -3591,9 +3592,12 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                 ),
               ),
               const SizedBox(height: 8),
-              const Text(
-                'Robots are standing by. Start operations to begin scouting.',
-                style: TextStyle(fontSize: 12, color: Color(0xFF8B949E)),
+              Text(
+                isOwner
+                    ? 'Robots are standing by. Start operations to begin scouting.'
+                    : 'View-only session — only the warehouse owner can start '
+                        'operations. You can watch the floor once it is running.',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF8B949E)),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 28),
@@ -3607,10 +3611,15 @@ class _FloorCanvasState extends ConsumerState<FloorCanvas>
                       borderRadius: BorderRadius.circular(8)),
                 ),
                 icon: const Icon(Icons.play_arrow_rounded),
-                label: const Text('START OPERATIONS',
-                    style: TextStyle(
+                label: Text(isOwner ? 'START OPERATIONS' : 'VIEW ONLY',
+                    style: const TextStyle(
                         fontWeight: FontWeight.bold, letterSpacing: 1.2)),
-                onPressed: () {
+                // Owner-only: only krishnavijayaram@gmail.com may start the live
+                // simulation; a null onPressed disables the button for everyone
+                // else, who stay in a read-only view.
+                onPressed: !isOwner
+                    ? null
+                    : () {
                   // AUTOMATED, not manual: this desktop DASH Start-Operations is
                   // the view most users actually run, and setting 'manual' here
                   // meant _launchSimulation called scout.startManual() — no tick
